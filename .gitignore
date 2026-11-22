@@ -1,0 +1,28 @@
+# Local bench notes and automation scripts (never commit).
+local-info/
+
+# Fetched third-party trees, model checkpoints, and caches.
+third_party/
+models/
+.cache/
+
+# Yocto kas-container working trees.
+yocto/sources/
+yocto/downloads/
+yocto/build/
+yocto/sstate-cache/
+kas-container
+
+# Build outputs.
+out/
+dsp/build/
+linux-app/c7x-ai
+linux-app/*.o
+beagle-linux/overlays/*.dtbo
+beagle-linux/overlays/*.dts.tmp
+*.o
+*.obj
+*.out
+*.map
+__pycache__/
+*.pyc

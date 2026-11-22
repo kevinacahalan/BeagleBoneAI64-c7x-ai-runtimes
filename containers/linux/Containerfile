@@ -1,0 +1,23 @@
+# Linux aarch64 cross-compile image for linux-app/ and the device-tree overlay.
+FROM docker.io/library/debian:13
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		make \
+		gcc \
+		g++ \
+		gcc-aarch64-linux-gnu \
+		g++-aarch64-linux-gnu \
+		libc6-dev-arm64-cross \
+		device-tree-compiler \
+		flex \
+		libfl-dev \
+		bison \
+		bc \
+		python3 \
+		ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

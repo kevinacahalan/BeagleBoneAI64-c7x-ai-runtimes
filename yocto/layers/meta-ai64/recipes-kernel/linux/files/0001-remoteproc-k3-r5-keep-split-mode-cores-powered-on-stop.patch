@@ -1,0 +1,61 @@
+From: Kevin Cahalan <kevinacahalan@gmail.com>
+Subject: [PATCH] remoteproc: k3-r5: keep split-mode cores powered on stop
+
+On the BeagleBone AI-64 (J721E), stopping a main-domain R5F core in split
+mode asks the device manager to power the core module off. It answers
+with a NACK (module-reset assert failed, -19), and the next start fails
+the same way, so the core cannot be restarted without a reboot.
+
+Do what the driver already does on AM64, on every SoC: assert the local
+reset and leave the module powered. This kernel is only built for the
+BeagleBone AI-64. The 6.18 Debian image uses the same change in
+beagle-linux/kernel/k3_r5_rproc.
+
+Upstream-Status: Inappropriate [board-specific workaround]
+---
+diff --git a/drivers/remoteproc/ti_k3_r5_remoteproc.c b/drivers/remoteproc/ti_k3_r5_remoteproc.c
+index d096ec9..1a98bac 100644
+--- a/drivers/remoteproc/ti_k3_r5_remoteproc.c
++++ b/drivers/remoteproc/ti_k3_r5_remoteproc.c
+@@ -140,8 +140,6 @@ struct k3_r5_core {
+ static int k3_r5_split_reset(struct k3_rproc *kproc)
+ {
+ 	int ret;
+-	struct k3_r5_core *core = kproc->priv;
+-	struct k3_r5_cluster *cluster = core->cluster;
+ 
+ 	ret = reset_control_assert(kproc->reset);
+ 	if (ret) {
+@@ -150,24 +148,15 @@ static int k3_r5_split_reset(struct k3_rproc *kproc)
+ 		return ret;
+ 	}
+ 
+-	/* On AM64 devices power-down of core1 in r5f cluster, even when core0
+-	 * is on randomly gets the lpsc stuck in transition state and makes the core
+-	 * un-usable. So as a work around keep the power state on with reset
+-	 * asserted.
++	/*
++	 * Keep the module powered with the local reset asserted. On AM64,
++	 * powering down core1 while core0 is on can leave the LPSC stuck in
++	 * transition. On J721E the device manager refuses the power-down of a
++	 * split-mode core (-ENODEV), and the core cannot be started again
++	 * after that. k3_r5_split_release() asks for the device again, which
++	 * is harmless while it is already on.
+ 	 */
+-	if (cluster->soc_data->single_cpu_mode)
+-		return ret;
+-
+-	ret = kproc->ti_sci->ops.dev_ops.put_device(kproc->ti_sci,
+-						    kproc->ti_sci_id);
+-	if (ret) {
+-		dev_err(kproc->dev, "module-reset assert failed, ret = %d\n",
+-			ret);
+-		if (reset_control_deassert(kproc->reset))
+-			dev_warn(kproc->dev, "local-reset deassert back failed\n");
+-	}
+-
+-	return ret;
++	return 0;
+ }
+ 
+ static int k3_r5_split_release(struct k3_rproc *kproc)
