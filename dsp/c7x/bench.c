@@ -9,6 +9,7 @@
 
 #include "c7x_ai_proto.h"
 #include "c7x_llama_fmt.h"
+#include "cmd_exec.h"
 #include "dru.h"
 #include "mma_kernels.h"
 #include "mmu.h"
@@ -291,6 +292,36 @@ int bench_poll(void)
 		aux1 = (uint64_t)argmax;
 		if (rc != 0) {
 			status = C7X_STATUS_BAD_ARGS;
+		}
+		break;
+	}
+
+	case C7X_OP_EXEC_LIST: {
+		uint32_t done = 0u, fail_idx = 0u;
+		void *l2_buf;
+		uint32_t l2_sz;
+		int rc;
+
+		if (k != 0u && k != C7X_CMD_ABI_VERSION) {
+			status = C7X_STATUS_BAD_ARGS;
+			break;
+		}
+		if ((b_addr != 0ull) != (n != 0u)) {
+			status = C7X_STATUS_BAD_ARGS;
+			break;
+		}
+		if (m > 0u && a_addr == 0ull) {
+			status = C7X_STATUS_BAD_ARGS;
+			break;
+		}
+		l2_buf = b_addr ? (void *)(uintptr_t)b_addr : (void *)(uintptr_t)C7X_L2_SCRATCH_ADDR;
+		l2_sz  = n ? n : C7X_L2_SCRATCH_SIZE;
+		rc = c7x_cmd_exec_list((const struct c7x_cmd *)(uintptr_t)a_addr,
+				       m, l2_buf, l2_sz, &done, &fail_idx);
+		aux0 = (uint64_t)done;
+		aux1 = ((uint64_t)(uint32_t)rc << 32) | (uint64_t)fail_idx;
+		if (rc != 0) {
+			status = C7X_STATUS_CMD_ERR;
 		}
 		break;
 	}

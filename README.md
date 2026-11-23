@@ -38,7 +38,9 @@ See **[`RESULTS.md`](RESULTS.md)** for complete hardware tables, **[`NOTES.md`](
 
 | Path | Purpose |
 | --- | --- |
-| [`dsp/`](dsp/) | Bare-metal C7x firmware (`c7x-ai.elf`): MMU/cache + 7.625 MiB MSMC L3 tables, bare-metal Type-9 `DRU0` DMA, MMA GEMM/W8A8/W4A8-g64 + B-stationary prefill + L2 ping-pong kernels, 512-bit FP32 vector & INT8 KV attention kernels, universal Llama/Qwen2/Qwen3 transformer engine, plus x86_64 host-emulation tests (`dsp/host_test/`) |
+| [`dsp/`](dsp/) | Bare-metal C7x firmware (`c7x-ai.elf`): MMU/cache + 7.625 MiB MSMC L3 tables, bare-metal Type-9 `DRU0` DMA, MMA GEMM/W8A8/W4A8-g64 + B-stationary prefill + L2 ping-pong kernels, 512-bit FP32 vector & INT8 KV attention kernels, command-buffer executor (`C7X_OP_EXEC_LIST`), universal Llama/Qwen2/Qwen3 transformer engine, plus x86_64 host-emulation tests (`dsp/host_test/`) |
+| [`libc7x/`](libc7x/) | Shared host C runtime library (`libc7x.a` for aarch64 hardware & `libc7x_hostemu.a` for x86_64 TI C7000 Host Emulation): coalescing DDR (1.5 GiB) + MSMC (7.625 MiB) arena allocator, `O_SYNC`-safe memory transfers, multi-process `flock` + ABI handshake, tile-major weight packers/unpackers, and single-RPC command-buffer builder |
+| [`ggml-c7x/`](ggml-c7x/) | Out-of-tree dynamic `llama.cpp` / `ggml` backend plugin (`libggml-c7x.so`) built on `libc7x`: loadable into unmodified `GGML_BACKEND_DL=ON` builds of `llama.cpp` via `GGML_BACKEND_PATH`, with eager `WEIGHTS` tile-major repacking, MSMC hot-weight pinning, and single-RPC subgraph execution |
 | [`linux-app/`](linux-app/) | Lean zero-dependency C host CLI (`c7x-ai`): remoteproc load/stop with `RP_MBOX_SHUTDOWN`, trace reader, hardware benchmark suite, `llama info`/`verify`/`run`/`chat`/`spec`, and `serve` (OpenAI HTTP/1.1 + SSE server with prefix KV caching) |
 | [`tools/`](tools/) | Universal HuggingFace Hub downloader & converter (`convert_hf.py --repo <org/model>`, stdlib HTTP + NumPy only), embedded `C7T1` BPE tokenizer compiler, Python/NumPy reference (`llama_ref.py`), and golden trace exporter |
 | [`beagle-linux/`](beagle-linux/) | Containerized build script (`scripts/build.sh`), board installer (`scripts/install-beagle.sh`), and DDR tensor arena overlay (`overlays/k3-j721e-beagleboneai64-c7x-ai.dtso`: 64 MiB @ `0xAC000000` + 1.5 GiB @ `0x880000000`) |
@@ -58,7 +60,17 @@ Requires `podman` or `docker` (no local toolchains needed):
 ./beagle-linux/scripts/build.sh all
 ```
 
-Or run individual targets: `host-test`, `dsp`, `linux`, `overlay`, `bundle`.
+Or run individual targets: `host-test`, `dsp`, `libc7x`, `ggml`, `linux`, `overlay`, `bundle`.
+
+### Using the `llama.cpp` Dynamic Backend (`libggml-c7x.so`)
+
+Build `llama.cpp` with dynamic backends enabled (`-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON`), then point `GGML_BACKEND_PATH` at `libggml-c7x.so` (built for aarch64 BeagleBone AI-64 in `ggml-c7x/build-aarch64/` or x86_64 TI C7000 Host Emulation in `ggml-c7x/build-hostemu/`):
+
+```bash
+# On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`):
+GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-bench --list-devices
+GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-completion -m model-Q4_0.gguf -ngl 99 -fa off -p "Hello"
+```
 
 ### 2. Deploy to the BeagleBone AI-64
 

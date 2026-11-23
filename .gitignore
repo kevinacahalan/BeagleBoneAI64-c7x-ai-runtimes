@@ -16,6 +16,10 @@ kas-container
 # Build outputs.
 out/
 dsp/build/
+libc7x/build-aarch64/
+libc7x/build-hostemu/
+ggml-c7x/build-aarch64/
+ggml-c7x/build-hostemu/
 linux-app/c7x-ai
 linux-app/*.o
 beagle-linux/overlays/*.dtbo

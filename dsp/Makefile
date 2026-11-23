@@ -3,12 +3,12 @@
 BUILD := build
 INC := include
 
-.PHONY: all clean host-test host-llama-test
+.PHONY: all clean host-test host-cmd-test host-llama-test
 
 all: $(BUILD)/c7x-ai.elf
 
 C7X_SRC := c7x/main.c c7x/mmu.c c7x/dru.c c7x/mma_kernels.c c7x/vec_kernels.c \
-           c7x/transformer.c c7x/bench.c c7x/regs.asm
+           c7x/transformer.c c7x/cmd_exec.c c7x/bench.c c7x/regs.asm
 C7X_OBJ := $(patsubst c7x/%.asm,$(BUILD)/c7x/%.obj,$(patsubst c7x/%.c,$(BUILD)/c7x/%.obj,$(C7X_SRC)))
 
 C7X_HDR := $(wildcard c7x/*.h) $(wildcard $(INC)/*.h)
@@ -32,9 +32,24 @@ $(BUILD)/c7x-ai.elf: $(C7X_OBJ) c7x/c7x.cmd
 		--reread_libs --warn_sections -m $(BUILD)/c7x-ai.map \
 		-o $@ $(C7X_OBJ) c7x/c7x.cmd --library=libc.a
 
-# Host emulation unit tests (MMA + FP32 vector kernels).
-host-test: $(BUILD)/host-test
+# Host emulation unit tests (MMA + FP32 vector kernels + command-buffer executor).
+host-test: $(BUILD)/host-test $(BUILD)/host-cmd-test
 	$(BUILD)/host-test
+	$(BUILD)/host-cmd-test
+
+host-cmd-test: $(BUILD)/host-cmd-test
+	$(BUILD)/host-cmd-test
+
+$(BUILD)/host-cmd-test: host_test/test_cmd.cpp c7x/cmd_exec.c c7x/cmd_exec.h \
+                        c7x/mma_kernels.c c7x/mma_kernels.h \
+                        c7x/vec_kernels.c c7x/vec_kernels.h $(INC)/c7x_cmd_proto.h
+	@if [ -z "$(C7X_CGT)" ]; then echo "C7X_CGT is not set" >&2; exit 1; fi
+	mkdir -p $(BUILD)
+	g++ -O2 -std=c++14 -D__C7X_HOSTEM__ -D_HOST_BUILD \
+		-I$(C7X_CGT)/host_emulation/include -Ic7x -I$(INC) \
+		-x c++ host_test/test_cmd.cpp c7x/cmd_exec.c c7x/mma_kernels.c c7x/vec_kernels.c \
+		$(C7X_CGT)/host_emulation/libc70-host-emulation.a \
+		-lm -o $@
 
 $(BUILD)/host-test: host_test/test_mma.cpp c7x/mma_kernels.c c7x/mma_kernels.h \
                     c7x/vec_kernels.c c7x/vec_kernels.h

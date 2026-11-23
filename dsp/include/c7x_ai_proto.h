@@ -64,6 +64,7 @@ enum c7x_op {
 	C7X_OP_VEC_SELFTEST  = 10u, /* Run built-in FP32 vector-unit kernel self-test */
 	C7X_OP_LLAMA_FORWARD = 11u, /* Run W8A8/W4A8 transformer single-token decode */
 	C7X_OP_LLAMA_PREFILL = 12u, /* Run batched multi-token MMA prefill */
+	C7X_OP_EXEC_LIST     = 13u, /* Execute flat command buffer (struct c7x_cmd[m] at a_addr) */
 };
 
 /* Status codes */
@@ -74,6 +75,7 @@ enum c7x_status {
 	C7X_STATUS_NO_DRU    = 3u,
 	C7X_STATUS_DRU_ERR   = 4u,
 	C7X_STATUS_MISMATCH  = 5u,
+	C7X_STATUS_CMD_ERR   = 6u,
 };
 
 /* Flags for GEMM/GEMV ops */

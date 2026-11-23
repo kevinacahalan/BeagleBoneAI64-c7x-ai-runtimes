@@ -73,6 +73,29 @@ build_linux() {
 		make -C linux-app clean all
 }
 
+build_libc7x() {
+	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	engine_run -v "$ROOT:/work" -w /work "$IMAGE_DSP" \
+		make -C libc7x C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu-test
+	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
+		make -C libc7x hw
+}
+
+build_ggml() {
+	local llama_dir=${LLAMA_DIR:-$ROOT/models/llama.cpp}
+	if [[ ! -f $llama_dir/ggml/include/ggml.h ]]; then
+		echo "skipping ggml-c7x ($llama_dir/ggml/include/ggml.h not found; clone llama.cpp or set LLAMA_DIR)" >&2
+		return 0
+	fi
+	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	engine_run -v "$ROOT:/work" -v "$llama_dir:/llama:ro" -w /work "$IMAGE_DSP" \
+		make -C ggml-c7x LLAMA_DIR=/llama C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu
+	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+	engine_run -v "$ROOT:/work" -v "$llama_dir:/llama:ro" -w /work "$IMAGE_LINUX" \
+		make -C ggml-c7x LLAMA_DIR=/llama hw
+}
+
 build_overlay() {
 	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
@@ -98,6 +121,9 @@ bundle() {
 	for f in "${files[@]}"; do
 		cp -p "$ROOT/$f" "$out/"
 	done
+	if [[ -f $ROOT/ggml-c7x/build-aarch64/libggml-c7x.so ]]; then
+		cp -p "$ROOT/ggml-c7x/build-aarch64/libggml-c7x.so" "$out/"
+	fi
 	echo "bundle in $out"
 	echo "  scp -r out/c7x-ai-beagle USER@BOARD:"
 	echo "  ssh -t USER@BOARD 'sudo ./c7x-ai-beagle/install-beagle.sh && sudo reboot'"
@@ -106,17 +132,21 @@ bundle() {
 case ${1:-all} in
 	host-test) build_host_test ;;
 	dsp) build_dsp ;;
+	libc7x) build_libc7x ;;
+	ggml) build_libc7x && build_ggml ;;
 	linux) build_linux ;;
 	overlay) build_overlay ;;
 	bundle) bundle ;;
 	all)
 		build_host_test
 		build_dsp
+		build_libc7x
+		build_ggml
 		build_linux
 		build_overlay
 		;;
 	*)
-		echo "usage: $0 [all|host-test|dsp|linux|overlay|bundle]" >&2
+		echo "usage: $0 [all|host-test|dsp|libc7x|ggml|linux|overlay|bundle]" >&2
 		exit 2
 		;;
 esac
