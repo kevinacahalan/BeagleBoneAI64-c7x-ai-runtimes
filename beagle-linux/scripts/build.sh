@@ -96,6 +96,16 @@ build_ggml() {
 		make -C ggml-c7x LLAMA_DIR=/llama hw
 }
 
+build_ort() {
+	python3 "$ROOT/ort-c7x-ep/tests/gen_onnx_models.py" "$ROOT/ort-c7x-ep/build-hostemu/models"
+	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	engine_run -v "$ROOT:/work" -w /work "$IMAGE_DSP" \
+		make -C ort-c7x-ep C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu-test
+	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
+		make -C ort-c7x-ep hw
+}
+
 build_overlay() {
 	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
@@ -134,6 +144,7 @@ case ${1:-all} in
 	dsp) build_dsp ;;
 	libc7x) build_libc7x ;;
 	ggml) build_libc7x && build_ggml ;;
+	ort) build_libc7x && build_ort ;;
 	linux) build_linux ;;
 	overlay) build_overlay ;;
 	bundle) bundle ;;
@@ -142,11 +153,12 @@ case ${1:-all} in
 		build_dsp
 		build_libc7x
 		build_ggml
+		build_ort
 		build_linux
 		build_overlay
 		;;
 	*)
-		echo "usage: $0 [all|host-test|dsp|libc7x|ggml|linux|overlay|bundle]" >&2
+		echo "usage: $0 [all|host-test|dsp|libc7x|ggml|ort|linux|overlay|bundle]" >&2
 		exit 2
 		;;
 esac

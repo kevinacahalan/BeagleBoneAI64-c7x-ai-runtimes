@@ -1100,6 +1100,130 @@ static bool lower_node(ggml_backend_c7x_context * ctx,
             return push_cmd(ctx, node, cmd, &sd, sizeof(sd));
         }
 
+        case GGML_OP_NORM: {
+            const struct ggml_tensor * src0 = node->src[0];
+            const uint64_t p_src0 = phys(src0), p_dst = phys(node);
+            if (!p_src0 || !p_dst) return false;
+            float eps = 1e-5f;
+            memcpy(&eps, node->op_params, sizeof(float));
+            struct c7x_norm_desc nd {};
+            for (int i = 0; i < 4; i++) {
+                nd.ne0[i]    = (uint32_t) src0->ne[i];
+                nd.nb0[i]    = (uint64_t) src0->nb[i];
+                nd.nb_dst[i] = (uint64_t) node->nb[i];
+            }
+            nd.eps       = eps;
+            nd.has_gamma = 0u;
+            nd.has_beta  = 0u;
+            cmd.op   = C7X_CMD_NORM_F32;
+            cmd.src0 = p_src0;
+            cmd.dst  = p_dst;
+            return push_cmd(ctx, node, cmd, &nd, sizeof(nd));
+        }
+
+        case GGML_OP_IM2COL: {
+            const struct ggml_tensor * src0 = node->src[0];
+            const struct ggml_tensor * src1 = node->src[1];
+            const uint64_t p_src1 = phys(src1), p_dst = phys(node);
+            uint32_t stype = 0, dtype = 0;
+            if (!src0 || !p_src1 || !p_dst ||
+                !ggml_type_to_c7x_dtype(src1->type, &stype) ||
+                !ggml_type_to_c7x_dtype(node->type, &dtype)) {
+                return false;
+            }
+            const int32_t * op_p = (const int32_t *) node->op_params;
+            const bool is_2d = (op_p[6] == 1);
+            struct c7x_im2col_desc id {};
+            id.N        = (uint32_t) (is_2d ? src1->ne[3] : src1->ne[2]);
+            id.IC       = (uint32_t) (is_2d ? src1->ne[2] : src1->ne[1]);
+            id.IH       = (uint32_t) (is_2d ? src1->ne[1] : 1);
+            id.IW       = (uint32_t) src1->ne[0];
+            id.KH       = (uint32_t) (is_2d ? src0->ne[1] : 1);
+            id.KW       = (uint32_t) src0->ne[0];
+            id.OH       = (uint32_t) (is_2d ? node->ne[2] : 1);
+            id.OW       = (uint32_t) node->ne[1];
+            id.s0       = op_p[0];
+            id.s1       = op_p[1];
+            id.p0       = op_p[2];
+            id.p1       = op_p[3];
+            id.d0       = op_p[4];
+            id.d1       = op_p[5];
+            id.is_2d    = is_2d ? 1u : 0u;
+            id.src_nb1  = is_2d ? (uint64_t) src1->nb[1] : 0ull;
+            id.src_nb_c = (uint64_t) (is_2d ? src1->nb[2] : src1->nb[1]);
+            id.src_nb_n = (uint64_t) (is_2d ? src1->nb[3] : src1->nb[2]);
+            cmd.op   = C7X_CMD_IM2COL;
+            cmd.p0   = stype;
+            cmd.p1   = dtype;
+            cmd.src1 = p_src1;
+            cmd.dst  = p_dst;
+            return push_cmd(ctx, node, cmd, &id, sizeof(id));
+        }
+
+        case GGML_OP_POOL_2D: {
+            const struct ggml_tensor * src0 = node->src[0];
+            const uint64_t p_src0 = phys(src0), p_dst = phys(node);
+            if (!p_src0 || !p_dst) return false;
+            const int32_t * opts = (const int32_t *) node->op_params;
+            struct c7x_pool2d_desc pd {};
+            pd.op       = (opts[0] == GGML_OP_POOL_MAX) ? C7X_POOL_MAX : C7X_POOL_AVG;
+            pd.IW       = (uint32_t) src0->ne[0];
+            pd.IH       = (uint32_t) src0->ne[1];
+            pd.OW       = (uint32_t) node->ne[0];
+            pd.OH       = (uint32_t) node->ne[1];
+            pd.n_planes = (uint32_t) (src0->ne[2] * src0->ne[3]);
+            pd.k0       = opts[1];
+            pd.k1       = opts[2];
+            pd.s0       = opts[3];
+            pd.s1       = opts[4];
+            pd.p0       = opts[5];
+            pd.p1       = opts[6];
+            pd.src_nb1  = (uint64_t) src0->nb[1];
+            pd.src_nb2  = (uint64_t) src0->nb[2];
+            pd.dst_nb1  = (uint64_t) node->nb[1];
+            pd.dst_nb2  = (uint64_t) node->nb[2];
+            cmd.op    = C7X_CMD_POOL_2D_F32;
+            cmd.flags = (src0->type == GGML_TYPE_F16) ? C7X_CMD_FLAG_SRC0_F16 : 0u;
+            cmd.src0  = p_src0;
+            cmd.dst   = p_dst;
+            return push_cmd(ctx, node, cmd, &pd, sizeof(pd));
+        }
+
+        case GGML_OP_CONV_2D: {
+            const struct ggml_tensor * src0 = node->src[0];
+            const struct ggml_tensor * src1 = node->src[1];
+            const uint64_t p_src0 = phys(src0), p_src1 = phys(src1), p_dst = phys(node);
+            if (!p_src0 || !p_src1 || !p_dst) return false;
+            const int32_t * op_p = (const int32_t *) node->op_params;
+            struct c7x_conv2d_f32_desc cd {};
+            cd.N        = (uint32_t) src1->ne[3];
+            cd.IC       = (uint32_t) src1->ne[2];
+            cd.IH       = (uint32_t) src1->ne[1];
+            cd.IW       = (uint32_t) src1->ne[0];
+            cd.OC       = (uint32_t) src0->ne[3];
+            cd.KH       = (uint32_t) src0->ne[1];
+            cd.KW       = (uint32_t) src0->ne[0];
+            cd.OH       = (uint32_t) node->ne[1];
+            cd.OW       = (uint32_t) node->ne[0];
+            cd.has_bias = 0u;
+            cd.s0       = op_p[0];
+            cd.s1       = op_p[1];
+            cd.p0       = op_p[2];
+            cd.p1       = op_p[3];
+            cd.d0       = op_p[4];
+            cd.d1       = op_p[5];
+            for (int i = 0; i < 4; i++) {
+                cd.src_nb[i] = (uint64_t) src1->nb[i];
+                cd.dst_nb[i] = (uint64_t) node->nb[i];
+            }
+            cmd.op    = C7X_CMD_CONV_2D_F32;
+            cmd.flags = (src0->type == GGML_TYPE_F16) ? C7X_CMD_FLAG_SRC0_F16 : 0u;
+            cmd.src0  = p_src0;
+            cmd.src1  = p_src1;
+            cmd.dst   = p_dst;
+            return push_cmd(ctx, node, cmd, &cd, sizeof(cd));
+        }
+
         default:
             return false;
     }
@@ -1469,6 +1593,58 @@ static bool ggml_backend_c7x_dev_supports_op(ggml_backend_dev_t dev, const struc
             }
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
                    op->type == GGML_TYPE_Q8_0;
+        }
+
+        case GGML_OP_NORM:
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_are_same_shape(op->src[0], op);
+
+        case GGML_OP_IM2COL: {
+            const struct ggml_tensor * src0 = op->src[0];
+            const struct ggml_tensor * src1 = op->src[1];
+            if (!src0 || !src1 || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (op->type == GGML_TYPE_F32) {
+                return src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float);
+            }
+            if (op->type == GGML_TYPE_F16) {
+                return (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+                       src1->nb[0] == ggml_type_size(src1->type);
+            }
+            return false;
+        }
+
+        case GGML_OP_POOL_2D: {
+            const struct ggml_tensor * src0 = op->src[0];
+            if (!src0 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+                return false;
+            }
+            if (src0->nb[0] != ggml_type_size(src0->type)) {
+                return false;
+            }
+            if (src0->ne[3] > 1 && src0->nb[3] != (size_t) src0->ne[2] * src0->nb[2]) {
+                return false;
+            }
+            const int32_t * opts = (const int32_t *) op->op_params;
+            return (opts[0] == GGML_OP_POOL_AVG || opts[0] == GGML_OP_POOL_MAX) &&
+                   opts[1] > 0 && opts[2] > 0;
+        }
+
+        case GGML_OP_CONV_2D: {
+            const struct ggml_tensor * src0 = op->src[0];
+            const struct ggml_tensor * src1 = op->src[1];
+            if (!src0 || !src1 || op->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+                return false;
+            }
+            return ggml_is_contiguous(src0) && src0->ne[2] == src1->ne[2];
         }
 
         default:

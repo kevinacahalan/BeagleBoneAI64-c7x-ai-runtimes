@@ -131,6 +131,11 @@ void c7x_unpack_w4a8_g64_to_q4_0(const uint8_t *w_packed, const float *w_scales,
 void c7x_unpack_w8a8_to_q8_0(const int8_t *w_tiled, const float *w_scales,
 			     uint32_t n, uint32_t k, void *q8_0_out);
 
+/* Asymmetric INT8/UINT8 QLinear weight packer (tile-major 64x64 + precomputed row sums). */
+size_t c7x_qlinear_packed_bytes(uint32_t n, uint32_t k, size_t *bsum_off_out);
+void   c7x_pack_qlinear_weights(const void *w_raw, int is_uint8, uint32_t n, uint32_t k,
+				int8_t *w_tiled, int32_t *b_sum);
+
 #ifdef __cplusplus
 }
 #endif

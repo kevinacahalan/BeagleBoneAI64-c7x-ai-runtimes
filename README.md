@@ -40,7 +40,8 @@ See **[`RESULTS.md`](RESULTS.md)** for complete hardware tables, **[`NOTES.md`](
 | --- | --- |
 | [`dsp/`](dsp/) | Bare-metal C7x firmware (`c7x-ai.elf`): MMU/cache + 7.625 MiB MSMC L3 tables, bare-metal Type-9 `DRU0` DMA, MMA GEMM/W8A8/W4A8-g64 + B-stationary prefill + L2 ping-pong kernels, 512-bit FP32 vector & INT8 KV attention kernels, command-buffer executor (`C7X_OP_EXEC_LIST`), universal Llama/Qwen2/Qwen3 transformer engine, plus x86_64 host-emulation tests (`dsp/host_test/`) |
 | [`libc7x/`](libc7x/) | Shared host C runtime library (`libc7x.a` for aarch64 hardware & `libc7x_hostemu.a` for x86_64 TI C7000 Host Emulation): coalescing DDR (1.5 GiB) + MSMC (7.625 MiB) arena allocator, `O_SYNC`-safe memory transfers, multi-process `flock` + ABI handshake, tile-major weight packers/unpackers, and single-RPC command-buffer builder |
-| [`ggml-c7x/`](ggml-c7x/) | Out-of-tree dynamic `llama.cpp` / `ggml` backend plugin (`libggml-c7x.so`) built on `libc7x`: loadable into unmodified `GGML_BACKEND_DL=ON` builds of `llama.cpp` via `GGML_BACKEND_PATH`, with eager `WEIGHTS` tile-major repacking, MSMC hot-weight pinning, and single-RPC subgraph execution |
+| [`ggml-c7x/`](ggml-c7x/) | Out-of-tree dynamic `llama.cpp` / `ggml` backend plugin (`libggml-c7x.so`) built on `libc7x`: loadable into unmodified `GGML_BACKEND_DL=ON` builds of `llama.cpp` / `whisper.cpp` via `GGML_BACKEND_PATH`, with eager `WEIGHTS` tile-major repacking (`Q4_0`/`Q4_1`/`Q5_0`/`Q5_K`/`Q6_K`/`Q8_0`/`Q4_K`), optional `GGML_C7X_W8A8=1` high-accuracy mode, MSMC hot-weight pinning, and Vision/Audio ops (`NORM`, `IM2COL`, `POOL_2D`, `CONV_2D`) |
+| [`ort-c7x-ep/`](ort-c7x-ep/) | ONNX Runtime Execution Provider (`libort-c7x-ep.so`) over `libc7x` command buffers: zero-dependency standard `.onnx` binary protobuf loader & compiler supporting asymmetric INT8/UINT8 `QLinearConv` (standard + depthwise), `QLinearMatMul`, `Conv`, `MatMul`/`Gemm`, `LayerNormalization`, pooling, and activations in a single DSP RPC |
 | [`linux-app/`](linux-app/) | Lean zero-dependency C host CLI (`c7x-ai`): remoteproc load/stop with `RP_MBOX_SHUTDOWN`, trace reader, hardware benchmark suite, `llama info`/`verify`/`run`/`chat`/`spec`, and `serve` (OpenAI HTTP/1.1 + SSE server with prefix KV caching) |
 | [`tools/`](tools/) | Universal HuggingFace Hub downloader & converter (`convert_hf.py --repo <org/model>`, stdlib HTTP + NumPy only), embedded `C7T1` BPE tokenizer compiler, Python/NumPy reference (`llama_ref.py`), and golden trace exporter |
 | [`beagle-linux/`](beagle-linux/) | Containerized build script (`scripts/build.sh`), board installer (`scripts/install-beagle.sh`), and DDR tensor arena overlay (`overlays/k3-j721e-beagleboneai64-c7x-ai.dtso`: 64 MiB @ `0xAC000000` + 1.5 GiB @ `0x880000000`) |
@@ -60,16 +61,28 @@ Requires `podman` or `docker` (no local toolchains needed):
 ./beagle-linux/scripts/build.sh all
 ```
 
-Or run individual targets: `host-test`, `dsp`, `libc7x`, `ggml`, `linux`, `overlay`, `bundle`.
+Or run individual targets: `host-test`, `dsp`, `libc7x`, `ggml`, `ort`, `linux`, `overlay`, `bundle`.
 
 ### Using the `llama.cpp` Dynamic Backend (`libggml-c7x.so`)
 
-Build `llama.cpp` with dynamic backends enabled (`-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON`), then point `GGML_BACKEND_PATH` at `libggml-c7x.so` (built for aarch64 BeagleBone AI-64 in `ggml-c7x/build-aarch64/` or x86_64 TI C7000 Host Emulation in `ggml-c7x/build-hostemu/`):
+Build `llama.cpp` with dynamic backends enabled (`-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON`), then point `GGML_BACKEND_PATH` at `libggml-c7x.so` (built for aarch64 BeagleBone AI-64 in `ggml-c7x/build-aarch64/` or x86_64 TI C7000 Host Emulation in `ggml-c7x/build-hostemu/`). Verified up to **`12.76×` faster prefill** (`63.02` vs `4.94 t/s` on `Qwen2.5-1.5B Q4_0`) and **`2.32×` faster decode** vs dual-core Cortex-A72:
 
 ```bash
 # On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`):
 GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-bench --list-devices
 GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-completion -m model-Q4_0.gguf -ngl 99 -fa off -p "Hello"
+# Optional high-accuracy W8A8 packing mode (reduces Q4_0/Q4_K PPL delta by 2.4-10x):
+GGML_C7X_W8A8=1 GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-completion -m model-Q4_K_M.gguf -ngl 99 -fa off -p "Hello"
+```
+
+### Using the ONNX Runtime C7x Execution Provider (`ort-c7x-ep`)
+
+Build and run real non-LLM `.onnx` vision (`mobilenet_qlinear.onnx`) and audio (`audio_enc_block.onnx`) models on hostemu or live BeagleBone AI-64 silicon:
+
+```bash
+./beagle-linux/scripts/build.sh ort
+# On BeagleBone AI-64:
+/tmp/ort-c7x/test_ort_c7x_ep /tmp/ort-c7x/models 20
 ```
 
 ### 2. Deploy to the BeagleBone AI-64
@@ -141,6 +154,8 @@ All CLI subcommands:
 4. **Done — 7.625 MiB MSMC, B-stationary prefill, INT8 KV (`2K–4K`), Qwen3 + 1.5B–1.7B models, & speculative decoding:** `1.5 GiB` high-DDR arena, `3,208 tok/s` `stories15M` / `395 tok/s` `SmolLM2-135M` / `210 tok/s` `Qwen2.5-0.5B` prefill, 4K-context INT8 KV, live `Qwen3-0.6B` (`27.2 tok/s`), `Qwen2.5-1.5B-Instruct` (`11.6 tok/s`), `Qwen3-1.7B` (`10.3 tok/s`), and documented speculative decoding analysis.
 5. **Done — Local LLM Appliance UX:** `convert_hf.py --repo` stdlib Hub downloader, `c7x-ai llama info`, persistent-KV multi-turn `c7x-ai llama chat`, and live-verified OpenAI HTTP/1.1 + SSE `c7x-ai serve`.
 6. **Done — Head-to-head `llama.cpp` benchmarks & GitHub Actions CI:** Verified **`5.8× – 13.8×` prefill** and **`3.0× – 3.8×` decode** speedup over dual-core Cortex-A72 `llama.cpp` (`11.3× – 27.4×` prefill / `5.6× – 6.7×` decode vs 1-core), plus automated containerized CI (`.github/workflows/ci.yml`).
+7. **Done — Reusable `libc7x` runtime + out-of-tree `llama.cpp` dynamic backend (`libggml-c7x.so`):** Zero-fork dynamic plugin over `C7X_OP_EXEC_LIST` delivering up to **`12.76×` faster prefill** and **`2.32×` faster decode** vs dual-core Cortex-A72 on unmodified `llama-bench` (`135M–1.5B` GGUFs), `915/915` `test-backend-ops` on live silicon, plus optional `GGML_C7X_W8A8=1` high-accuracy mode.
+8. **Done — Non-LLM expansion (Vision/Audio `ggml-c7x` ops & `ort-c7x-ep` ONNX Runtime Execution Provider):** Added `NORM`, `IM2COL`, `POOL_2D`, `CONV_2D` (`710/710` + `1,574/1,574` live silicon `test-backend-ops`, `2,030/2,030` hostemu), plus asymmetric INT8/UINT8 `QLinearConv`, `QLinearMatMul` (`19.6 GOPS`, `4.75×` vs A72), `DequantizeLinear`, and standalone `.onnx` execution (`mobilenet_qlinear.onnx` at `82 FPS`, `audio_enc_block.onnx` at `883 FPS`).
 
 ---
 

@@ -20,6 +20,8 @@ libc7x/build-aarch64/
 libc7x/build-hostemu/
 ggml-c7x/build-aarch64/
 ggml-c7x/build-hostemu/
+ort-c7x-ep/build-aarch64/
+ort-c7x-ep/build-hostemu/
 linux-app/c7x-ai
 linux-app/*.o
 beagle-linux/overlays/*.dtbo

@@ -287,3 +287,27 @@ Comparing unmodified `llama-bench` on the exact same BeagleBone AI-64 with `-ngl
 | **`Qwen2.5-0.5B` `Q4_K_M`** | `66.41 ± 12.62` (`66.8 s`) | `75.98 ± 14.63` (`28.4 s`, `+14.4%`) | **`70.36 ± 13.42` (`+5.9%`)** | `W8A8=1` matches `W4A8` prefill speed (`119.14 t/s`) while slashing PPL delta by `2.4×` |
 
 *Key optimizations behind the **58× speedup** from initial `ggml-c7x` bring-up (`2.99 → 175.07 t/s` on `SmolLM2-135M pp128`):* eliminating mid-graph CPU splits via `Q4_1`/`Q5_0`/`Q5_K`/`Q6_K` repacking, L2-SRAM-staged GQA attention (`stage_src0_to_l2` 2D `SE0` F16→F32 + unbranched `k_v=1,2,4,8` `SE0` streaming), 16-wide branchless Cody-Waite RoPE, contiguous-`dst` row-`memcpy` `CONT` (`15×` speedup), and 16-wide vectorized `SET_ROWS` for `llama.cpp`'s flattened transposed V-cache writes.
+
+---
+
+## Milestone 8: Non-LLM Expansion — Vision/Audio `ggml-c7x` Ops & ONNX Runtime Execution Provider (`ort-c7x-ep`)
+
+Extended the exact same `C7X_OP_EXEC_LIST` + `libc7x` command-buffer stack beyond LLMs to **audio (`whisper.cpp`)**, **vision CNNs**, and **standard `.onnx` models** via 7 new DSP opcodes (`C7X_CMD_NORM_F32`, `C7X_CMD_IM2COL`, `C7X_CMD_POOL_2D_F32`, `C7X_CMD_CONV_2D_F32`, `C7X_CMD_QLINEAR_MATMUL`, `C7X_CMD_QLINEAR_CONV2D`, `C7X_CMD_DEQUANTIZE_LIN`) with L2-fused `im2col + MMA` and 16-wide SIMD asymmetric INT8/UINT8 requantization (`qlinear_epilogue_vec16`, IEEE round-to-nearest-even across both vector and scalar tail paths, and 64-byte-alignment-safe `Y_F32` output stores).
+
+### 1. Live BeagleBone AI-64 `ggml-c7x` Vision & Audio Op Verification (`test-backend-ops`)
+
+| Op Filter | Hostemu | Live BeagleBone AI-64 Silicon | Notes |
+| --- | --- | --- | --- |
+| `NORM\|IM2COL\|POOL_2D` | **710 / 710 PASS** | **710 / 710 PASS** | LayerNorm, 1D/2D F32/F16 `im2col`, Avg/Max 2D pooling |
+| `CONV_2D` (`f32`/`f16`, up to `256×256×192→96`) | **2,030 / 2,030 PASS** | **1,574 / 1,574 PASS** (`cwhn=0`) | L2-staged kernel strips + 56 GB/s SE0 streaming; covers odd strides, dilations, padding, `kernel_offset=1` (`cwhn=1` CPU ref requires >2 GiB RAM on board) |
+
+### 2. Live BeagleBone AI-64 ONNX Runtime Execution Provider (`ort-c7x-ep`) Results
+
+Zero-dependency standard `.onnx` binary protobuf loader & compiler (`ort-c7x-ep/libort-c7x-ep.so`) lowering full multi-layer ONNX graphs into a **single `C7X_OP_EXEC_LIST` RPC** with strict ONNX-exact `QLinearConv`/`QLinearMatMul` + standalone `DequantizeLinear` semantics:
+
+| ONNX Workload | Graph Summary | Commands / RPC | Accuracy vs Reference | C7x DSP Latency | Wall Latency | Throughput / vs A72 |
+| --- | --- | ---: | --- | ---: | ---: | --- |
+| **`mobilenet_qlinear.onnx`** | 4-layer INT8/UINT8 `QLinearConv` (`3×3 s=2` `OC=34` `w_zp=-3` → DW `3×3 s=2` → PW `1×1` → `3×3 s=2`) + `DequantizeLinear` + `Relu` + `GlobalAveragePool` + `Gemm` (`NCLS=18`) | `9` | `cos = 1.000000`<br>`max_err = 0.00431` | **`12.23 ms`** | **`12.26 ms`** | **`81.6 FPS`** (`2.86×` faster after SIMD epilogue) |
+| **`audio_enc_block.onnx`** | Whisper-style `Conv 3×3 s=2` + `Gelu(tanh)` + `LayerNormalization` + `MatMul` FFN + residual `Add` | `7` | **`cos = 1.000000`**<br>**`max_err = 0.000000`** | **`1.13 ms`** | **`1.13 ms`** | **`882.6 FPS`** |
+| **`QLinearMatMul 60×256×256`** | Asymmetric `UINT8 (zp=133) × INT8 (zp=-7) → UINT8 (zp=120)`, per-channel scales, `int32` bias | `1` | **`max_qdiff = 0`** *(bit-exact)* | **`0.400 ms`** | **`0.405 ms`** | **`19.6 GOPS` (`4.75×` vs A72 `1.90 ms`)** |
+| **`QLinearMatMul 5×70×70` (`Y_F32`)** | Unaligned non-16-multiple `N=70` float32 output (`280 B` row stride) + half-to-even tie check | `1` | **`max_err = 0.000000`** *(bit-exact)* | — | — | Verified on live C71x silicon (`VST16W` alignment guard) |

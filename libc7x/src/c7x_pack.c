@@ -553,3 +553,63 @@ void c7x_unpack_w8a8_to_q8_0(const int8_t *w_tiled, const float *w_scales,
 		}
 	}
 }
+
+size_t c7x_qlinear_packed_bytes(uint32_t n, uint32_t k, size_t *bsum_off_out)
+{
+	size_t n_pad = align64_u32(n);
+	size_t k_pad = align64_u32(k);
+	size_t w_bytes = n_pad * k_pad;
+	size_t bsum_bytes = n_pad * sizeof(int32_t);
+
+	if (bsum_off_out) {
+		*bsum_off_out = w_bytes;
+	}
+	return align64_sz(w_bytes + bsum_bytes);
+}
+
+void c7x_pack_qlinear_weights(const void *w_raw, int is_uint8, uint32_t n, uint32_t k,
+			      int8_t *w_tiled, int32_t *b_sum)
+{
+	uint32_t n_pad = align64_u32(n);
+	uint32_t k_pad = align64_u32(k);
+	uint32_t kt_cnt = k_pad >> 6;
+	uint32_t row, kt, c;
+
+	memset(w_tiled, 0, (size_t)n_pad * k_pad);
+	memset(b_sum, 0, (size_t)n_pad * sizeof(int32_t));
+
+	for (row = 0u; row < n; row++) {
+		uint32_t nt = row >> 6;
+		uint32_t r  = row & 63u;
+		int32_t s = 0;
+
+		if (is_uint8) {
+			const uint8_t *src = (const uint8_t *)w_raw + (size_t)row * k;
+			for (kt = 0u; kt < kt_cnt; kt++) {
+				int8_t *tile = w_tiled + ((size_t)nt * kt_cnt + kt) * 4096u;
+				for (c = 0u; c < 64u; c++) {
+					uint32_t col = kt * 64u + c;
+					if (col < k) {
+						int32_t v = (int32_t)src[col] - 128;
+						tile[r * 64u + c] = (int8_t)v;
+						s += v;
+					}
+				}
+			}
+		} else {
+			const int8_t *src = (const int8_t *)w_raw + (size_t)row * k;
+			for (kt = 0u; kt < kt_cnt; kt++) {
+				int8_t *tile = w_tiled + ((size_t)nt * kt_cnt + kt) * 4096u;
+				for (c = 0u; c < 64u; c++) {
+					uint32_t col = kt * 64u + c;
+					if (col < k) {
+						int8_t v = src[col];
+						tile[r * 64u + c] = v;
+						s += (int32_t)v;
+					}
+				}
+			}
+		}
+		b_sum[row] = s;
+	}
+}
