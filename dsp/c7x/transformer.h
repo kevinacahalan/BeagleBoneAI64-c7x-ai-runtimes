@@ -44,7 +44,8 @@ int c7x_llama_validate(const struct c7m_header *hdr);
  */
 int c7x_llama_forward_token(const struct c7m_header *hdr,
 			    uint32_t token, uint32_t pos,
-			    float *k_cache, float *v_cache,
+			    void *k_cache, void *v_cache,
+			    float *k_scale, float *v_scale, uint32_t req_flags,
 			    float *logits_out, uint32_t *argmax_out,
 			    void *scratch, uint32_t scratch_bytes,
 			    const void *msmc_layers, uint32_t msmc_n_layers,
@@ -55,12 +56,13 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 /*
  * Batched multi-token MMA prefill:
  *   Processes tokens[0..n_tokens-1] at positions start_pos..start_pos+n_tokens-1
- *   in chunks of up to 60 tokens (16 in host emulation), reading weights once
- *   per chunk on the MMA and running the classifier only for the last token.
+ *   in chunks of up to 240 tokens (B-stationary W4A8 reuse), running the classifier
+ *   for the last token (or all tokens if C7X_LLAMA_REQ_ALL_LOGITS is set).
  */
 int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			     const uint32_t *tokens, uint32_t n_tokens, uint32_t start_pos,
-			     float *k_cache, float *v_cache,
+			     void *k_cache, void *v_cache,
+			     float *k_scale, float *v_scale, uint32_t req_flags,
 			     float *logits_out, uint32_t *argmax_out,
 			     void *l2_scratch, uint32_t l2_bytes,
 			     void *prefill_buf, uint32_t prefill_bytes,

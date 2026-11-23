@@ -81,7 +81,7 @@ static int c7x_exec_op(volatile struct c7x_ctrl *ctrl, uint32_t op,
 {
 	uint32_t next_seq = ctrl->req_seq + 1u;
 	double t0;
-	const double timeout_us = 30000000.0; /* 30 s */
+	const double timeout_us = 120000000.0; /* 120 s */
 
 	ctrl->op     = op;
 	ctrl->flags  = 0u;
@@ -307,17 +307,21 @@ static int str_lookup(const char *str, struct tok_index *sorted, int vocab_size)
 	return res ? res->id : -1;
 }
 
-static int c7t_bpe_chunk(struct tokenizer *t, const uint8_t *chunk, size_t len,
-			 int *out, int max_out)
+static int c7t_bpe_chunk_small(struct tokenizer *t, const uint8_t *chunk, size_t len,
+			       int *out, int max_out)
 {
-	int ids[1024];
+	int *ids;
 	int n = 0;
 	size_t i;
 
-	if (len == 0u) {
+	if (len == 0u || max_out <= 0) {
 		return 0;
 	}
-	for (i = 0u; i < len && n < 1024; i++) {
+	ids = malloc(len * sizeof(int));
+	if (!ids) {
+		return 0;
+	}
+	for (i = 0u; i < len; i++) {
 		int id = t->c7t_byte_to_id[chunk[i]];
 		if (id >= 0) {
 			ids[n++] = id;
@@ -352,7 +356,32 @@ static int c7t_bpe_chunk(struct tokenizer *t, const uint8_t *chunk, size_t len,
 	for (int j = 0; j < emit; j++) {
 		out[j] = ids[j];
 	}
+	free(ids);
 	return emit;
+}
+
+static int c7t_bpe_chunk(struct tokenizer *t, const uint8_t *chunk, size_t len,
+			 int *out, int max_out)
+{
+	/* Split very long text at whitespace boundaries (~512 B) to keep O(L^2) BPE instant. */
+	size_t off = 0u;
+	int emitted = 0;
+
+	while (off < len && emitted < max_out) {
+		size_t rem = len - off;
+		size_t take = rem;
+
+		if (take > 512u) {
+			take = 512u;
+			while (take > 256u && chunk[off + take] != ' ' && chunk[off + take] != '\n') {
+				take--;
+			}
+		}
+		emitted += c7t_bpe_chunk_small(t, chunk + off, take,
+					       out + emitted, max_out - emitted);
+		off += take;
+	}
+	return emitted;
 }
 
 static int tokenizer_encode(struct tokenizer *t, const char *text, int bos, int eos,
@@ -494,6 +523,8 @@ struct llama_arena {
 	size_t off_model;
 	size_t off_k_cache;
 	size_t off_v_cache;
+	size_t off_k_scale;
+	size_t off_v_scale;
 	size_t off_logits;
 	size_t off_debug_x;
 	size_t off_prof;
@@ -502,19 +533,24 @@ struct llama_arena {
 	size_t off_prefill_buf;
 	size_t prefill_buf_bytes;
 	size_t kv_bytes;
+	size_t kv_scale_bytes;
 	size_t total_used;
 	uint32_t msmc_n_layers;
+	int kv_int8;
 
 	uint8_t *embedded_tok;
 	size_t embedded_tok_size;
 };
 
-static int arena_load_model(struct llama_arena *a, const char *model_path)
+static int arena_load_model_at(struct llama_arena *a, const char *model_path,
+			       int kv_mode, size_t base_off, int use_msmc,
+			       size_t prefill_cap_bytes)
 {
+	/* kv_mode: -1 = auto (INT8 when seq_len >= 1024), 0 = fp32, 1 = int8 */
 	FILE *f;
 	long fsz;
 	uint8_t *host_buf;
-	size_t off = 0;
+	size_t off = align64_sz(base_off);
 
 	memset(a, 0, sizeof(*a));
 
@@ -532,7 +568,7 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 
 	a->ctrl = (volatile struct c7x_ctrl *)map_phys((off_t)C7X_CTRL_ADDR, C7X_CTRL_SIZE);
 	a->ddr  = (uint8_t *)map_phys((off_t)a->arena_base, a->arena_size);
-	a->msmc = (uint8_t *)map_phys((off_t)C7X_MSMC_BASE, C7X_MSMC_SIZE);
+	a->msmc = use_msmc ? (uint8_t *)map_phys((off_t)C7X_MSMC_BASE, C7X_MSMC_SIZE) : NULL;
 	if (!a->ctrl || !a->ddr) {
 		fprintf(stderr, "failed to map C7x control block or DDR arena 0x%08" PRIx64 "\n",
 			a->arena_base);
@@ -552,9 +588,10 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 	fseek(f, 0, SEEK_END);
 	fsz = ftell(f);
 	fseek(f, 0, SEEK_SET);
-	if (fsz < (long)sizeof(struct c7m_header) || (size_t)fsz > a->arena_size) {
-		fprintf(stderr, "model size %.2f MiB exceeds %.0f MiB DDR arena\n",
-			(double)fsz / (1024.0 * 1024.0), (double)a->arena_size / (1024.0 * 1024.0));
+	if (fsz < (long)sizeof(struct c7m_header) || off + (size_t)fsz > a->arena_size) {
+		fprintf(stderr, "model size %.2f MiB at offset %.2f MiB exceeds %.0f MiB DDR arena\n",
+			(double)fsz / (1024.0 * 1024.0), (double)off / (1024.0 * 1024.0),
+			(double)a->arena_size / (1024.0 * 1024.0));
 		fclose(f);
 		return -1;
 	}
@@ -574,12 +611,30 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 	a->off_model = off;
 	off += align64_sz((size_t)fsz);
 
-	a->kv_bytes = (size_t)a->hdr.n_layers * a->hdr.seq_len * a->hdr.kv_dim * sizeof(float);
+	if (kv_mode < 0) {
+		a->kv_int8 = (a->hdr.seq_len >= 1024u) ? 1 : 0;
+	} else {
+		a->kv_int8 = kv_mode ? 1 : 0;
+	}
+
+	if (a->kv_int8) {
+		a->kv_bytes = (size_t)a->hdr.n_layers * a->hdr.seq_len * a->hdr.kv_dim;
+		a->kv_scale_bytes = (size_t)a->hdr.n_layers * a->hdr.seq_len * a->hdr.n_kv_heads * sizeof(float);
+	} else {
+		a->kv_bytes = (size_t)a->hdr.n_layers * a->hdr.seq_len * a->hdr.kv_dim * sizeof(float);
+		a->kv_scale_bytes = 0u;
+	}
 	a->off_k_cache = off;
 	off += align64_sz(a->kv_bytes);
 
 	a->off_v_cache = off;
 	off += align64_sz(a->kv_bytes);
+
+	a->off_k_scale = off;
+	off += align64_sz(a->kv_scale_bytes);
+
+	a->off_v_scale = off;
+	off += align64_sz(a->kv_scale_bytes);
 
 	a->off_logits = off;
 	off += align64_sz((size_t)a->hdr.vocab_size * sizeof(float));
@@ -597,9 +652,10 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 	off += align64_sz(4096u * sizeof(uint32_t)); /* up to 4096 prompt token IDs */
 
 	a->off_prefill_buf = off;
-	a->prefill_buf_bytes = (a->arena_size >= 256u * 1024u * 1024u)
-			       ? (32u * 1024u * 1024u)
-			       : (8u * 1024u * 1024u);
+	a->prefill_buf_bytes = prefill_cap_bytes ? prefill_cap_bytes
+			       : ((a->arena_size >= 256u * 1024u * 1024u)
+				  ? (32u * 1024u * 1024u)
+				  : (8u * 1024u * 1024u));
 	if (off + a->prefill_buf_bytes > a->arena_size) {
 		a->prefill_buf_bytes = (a->arena_size > off)
 				       ? ((a->arena_size - off) & ~((size_t)63u))
@@ -655,6 +711,10 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 	}
 	mmio_zero(a->ddr + a->off_k_cache, a->kv_bytes);
 	mmio_zero(a->ddr + a->off_v_cache, a->kv_bytes);
+	if (a->kv_scale_bytes > 0u) {
+		mmio_zero(a->ddr + a->off_k_scale, a->kv_scale_bytes);
+		mmio_zero(a->ddr + a->off_v_scale, a->kv_scale_bytes);
+	}
 
 	/* Stage as many leading decoder layers as fit into on-chip 7.625 MiB MSMC SRAM. */
 	if (a->msmc && a->hdr.off_layers_base != 0u && a->hdr.layer_stride != 0u) {
@@ -690,8 +750,10 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 		} else if (a->hdr.flags & C7M_FLAG_TILED_WEIGHTS) {
 			mode_str = "w8a8-tiled";
 		}
-		printf("[llama] loaded %s (%.2f MiB, %s) into DDR 0x%08" PRIx64 " (used %.2f/%.0f MiB), staged %u/%u layers (%.2f MiB) in MSMC SRAM in %.1f ms\n",
+		printf("[llama] loaded %s (%.2f MiB, %s, kv=%s %.2f MiB) into DDR 0x%08" PRIx64 " (used %.2f/%.0f MiB), staged %u/%u layers (%.2f MiB) in MSMC SRAM in %.1f ms\n",
 		       model_path, (double)fsz / (1024.0 * 1024.0), mode_str,
+		       a->kv_int8 ? "int8" : "fp32",
+		       (double)(2u * (a->kv_bytes + a->kv_scale_bytes)) / (1024.0 * 1024.0),
 		       a->arena_base,
 		       (double)a->total_used / (1024.0 * 1024.0),
 		       (double)a->arena_size / (1024.0 * 1024.0),
@@ -699,11 +761,17 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 		       (double)a->msmc_n_layers * a->hdr.layer_stride / (1024.0 * 1024.0),
 		       (now_us() - t0) / 1000.0);
 	}
-	printf("[llama] config: dim=%u (pad %u), hidden=%u (pad %u), layers=%u, heads=%u/%u, vocab=%u, seq=%u\n",
+	printf("[llama] config: dim=%u (pad %u), hidden=%u (pad %u), layers=%u, heads=%u/%u (hd=%u), vocab=%u, seq=%u%s\n",
 	       a->hdr.dim, a->hdr.dim_pad, a->hdr.hidden_dim, a->hdr.hidden_pad,
-	       a->hdr.n_layers, a->hdr.n_heads, a->hdr.n_kv_heads,
-	       a->hdr.vocab_size, a->hdr.seq_len);
+	       a->hdr.n_layers, a->hdr.n_heads, a->hdr.n_kv_heads, a->hdr.head_size,
+	       a->hdr.vocab_size, a->hdr.seq_len,
+	       (a->hdr.flags & C7M_FLAG_HAS_QK_NORM) ? ", qk-norm" : "");
 	return 0;
+}
+
+static int arena_load_model(struct llama_arena *a, const char *model_path, int kv_mode)
+{
+	return arena_load_model_at(a, model_path, kv_mode, 0u, 1, 0u);
 }
 
 static void arena_close(struct llama_arena *a)
@@ -742,6 +810,11 @@ static int arena_forward_token(struct llama_arena *a, uint32_t token, uint32_t p
 	req.pos              = pos;
 	req.debug_layer      = debug_layer;
 	req.stop_after_layer = stop_after_layer;
+	if (a->kv_int8) {
+		req.flags        = C7X_LLAMA_REQ_KV_INT8;
+		req.k_scale_addr = a->arena_base + a->off_k_scale;
+		req.v_scale_addr = a->arena_base + a->off_v_scale;
+	}
 
 	mmio_write(a->ddr + a->off_req, &req, sizeof(req));
 
@@ -767,10 +840,11 @@ static int arena_forward_token(struct llama_arena *a, uint32_t token, uint32_t p
 	return 0;
 }
 
-static int arena_prefill_tokens(struct llama_arena *a, const uint32_t *tokens,
-				uint32_t n_tokens, uint32_t start_pos,
-				float *logits_host, uint32_t *argmax_out,
-				struct c7x_llama_prof *prof_host, double *wall_us)
+static int arena_prefill_tokens_once(struct llama_arena *a, const uint32_t *tokens,
+				     uint32_t n_tokens, uint32_t start_pos,
+				     uint32_t extra_flags,
+				     float *logits_host, uint32_t *argmax_out,
+				     struct c7x_llama_prof *prof_host, double *wall_us)
 {
 	struct c7x_llama_req req;
 
@@ -792,6 +866,12 @@ static int arena_prefill_tokens(struct llama_arena *a, const uint32_t *tokens,
 	req.tokens_addr       = a->arena_base + a->off_tokens;
 	req.prefill_buf_addr  = a->arena_base + a->off_prefill_buf;
 	req.prefill_buf_bytes = (uint32_t)a->prefill_buf_bytes;
+	req.flags             = extra_flags;
+	if (a->kv_int8) {
+		req.flags       |= C7X_LLAMA_REQ_KV_INT8;
+		req.k_scale_addr = a->arena_base + a->off_k_scale;
+		req.v_scale_addr = a->arena_base + a->off_v_scale;
+	}
 
 	mmio_write(a->ddr + a->off_req, &req, sizeof(req));
 
@@ -803,11 +883,75 @@ static int arena_prefill_tokens(struct llama_arena *a, const uint32_t *tokens,
 		*argmax_out = (uint32_t)a->ctrl->aux1;
 	}
 	if (logits_host) {
-		mmio_read(logits_host, a->ddr + a->off_logits,
-			  (size_t)a->hdr.vocab_size * sizeof(float));
+		if (extra_flags & C7X_LLAMA_REQ_ALL_ARGMAX) {
+			mmio_read(logits_host, a->ddr + a->off_logits,
+				  (size_t)n_tokens * sizeof(uint32_t));
+		} else {
+			size_t n_log = (extra_flags & C7X_LLAMA_REQ_ALL_LOGITS)
+				       ? ((size_t)n_tokens * a->hdr.vocab_size)
+				       : (size_t)a->hdr.vocab_size;
+			mmio_read(logits_host, a->ddr + a->off_logits, n_log * sizeof(float));
+		}
 	}
 	if (prof_host) {
 		mmio_read(prof_host, a->ddr + a->off_prof, sizeof(*prof_host));
+	}
+	return 0;
+}
+
+static int arena_prefill_tokens(struct llama_arena *a, const uint32_t *tokens,
+				uint32_t n_tokens, uint32_t start_pos,
+				float *logits_host, uint32_t *argmax_out,
+				struct c7x_llama_prof *prof_host, double *wall_us)
+{
+	/* Chunk large prompts (<= 240 tok/RPC) to keep RPC latency bounded on 2K-4K contexts. */
+	const uint32_t chunk_max = 240u;
+	uint32_t done = 0u;
+	double tot_wall = 0.0;
+	struct c7x_llama_prof p_acc, p_cur;
+
+	if (n_tokens == 0u || n_tokens > 4096u) {
+		return -1;
+	}
+	memset(&p_acc, 0, sizeof(p_acc));
+
+	while (done < n_tokens) {
+		uint32_t m = (n_tokens - done < chunk_max) ? (n_tokens - done) : chunk_max;
+		int is_last = (done + m == n_tokens);
+		double w_us = 0.0;
+
+		if (arena_prefill_tokens_once(a, tokens + done, m, start_pos + done, 0u,
+					      is_last ? logits_host : NULL,
+					      is_last ? argmax_out : NULL,
+					      prof_host ? &p_cur : NULL, &w_us) != 0) {
+			return -1;
+		}
+		tot_wall += w_us;
+		if (prof_host) {
+			p_acc.cyc_total        += p_cur.cyc_total;
+			p_acc.cyc_emb          += p_cur.cyc_emb;
+			p_acc.cyc_rmsnorm      += p_cur.cyc_rmsnorm;
+			p_acc.cyc_quant        += p_cur.cyc_quant;
+			p_acc.cyc_qkv_mma      += p_cur.cyc_qkv_mma;
+			p_acc.cyc_rope         += p_cur.cyc_rope;
+			p_acc.cyc_attn         += p_cur.cyc_attn;
+			p_acc.cyc_wo_mma       += p_cur.cyc_wo_mma;
+			p_acc.cyc_ffn_up_mma   += p_cur.cyc_ffn_up_mma;
+			p_acc.cyc_swiglu       += p_cur.cyc_swiglu;
+			p_acc.cyc_ffn_down_mma += p_cur.cyc_ffn_down_mma;
+			p_acc.cyc_cls_mma      += p_cur.cyc_cls_mma;
+			p_acc.cyc_dequant      += p_cur.cyc_dequant;
+			for (uint32_t l = 0u; l < a->hdr.n_layers && l < C7M_MAX_LAYERS; l++) {
+				p_acc.cyc_layer[l] += p_cur.cyc_layer[l];
+			}
+		}
+		done += m;
+	}
+	if (prof_host) {
+		*prof_host = p_acc;
+	}
+	if (wall_us) {
+		*wall_us = tot_wall;
 	}
 	return 0;
 }
@@ -1259,13 +1403,24 @@ static void compare_vec(const char *label, const float *got, const float *want,
 static int cmd_llama_verify(int argc, char **argv)
 {
 	if (argc < 6) {
-		fprintf(stderr, "usage: c7x-ai llama verify <model.c7m> <tokenizer.bin> <golden.bin> [steps]\n");
+		fprintf(stderr, "usage: c7x-ai llama verify <model.c7m> <tokenizer.bin> <golden.bin> [steps] [--kv-int8|--kv-fp32]\n");
 		return 2;
 	}
 	const char *model_path = argv[3];
 	const char *tok_path   = argv[4];
 	const char *gold_path  = argv[5];
-	uint32_t steps = argc > 6 ? (uint32_t)atoi(argv[6]) : 40u;
+	uint32_t steps = 40u;
+	int kv_mode = 0; /* default FP32 KV for bit-exact golden verification */
+
+	for (int ai = 6; ai < argc; ai++) {
+		if (strcmp(argv[ai], "--kv-int8") == 0) {
+			kv_mode = 1;
+		} else if (strcmp(argv[ai], "--kv-fp32") == 0) {
+			kv_mode = 0;
+		} else if (argv[ai][0] != '-') {
+			steps = (uint32_t)atoi(argv[ai]);
+		}
+	}
 
 	struct llama_arena a;
 	struct tokenizer tok;
@@ -1274,7 +1429,7 @@ static int cmd_llama_verify(int argc, char **argv)
 	uint8_t *gbuf;
 	int fail = 0;
 
-	if (arena_load_model(&a, model_path) != 0) {
+	if (arena_load_model(&a, model_path, kv_mode) != 0) {
 		return 1;
 	}
 
@@ -1364,14 +1519,23 @@ static int cmd_llama_verify(int argc, char **argv)
 	compare_vec("silicon_l0_out", dbg_x, g_l0, a.hdr.dim, &err, &cos_sim);
 	printf("[verify] layer0 single-layer latency: %.3f ms (%" PRIu64 " C7x cyc)\n",
 	       (double)prof.cyc_total / 1e6, prof.cyc_total);
-	if (err > 1e-4f || cos_sim < 0.999999) {
+	if (a.kv_int8) {
+		if (cos_sim < 0.995) {
+			fprintf(stderr, "FAIL: silicon layer0_out (kv=int8) diverged!\n");
+			fail = 1;
+		}
+	} else if (err > 1e-4f || cos_sim < 0.999999) {
 		fprintf(stderr, "FAIL: silicon layer0_out diverged from Python reference!\n");
 		fail = 1;
 	}
 
-	/* Step 3: Full 6-layer greedy generation on live C7x silicon */
+	/* Step 3: Full-layer greedy generation on live C7x silicon */
 	mmio_zero(a.ddr + a.off_k_cache, a.kv_bytes);
 	mmio_zero(a.ddr + a.off_v_cache, a.kv_bytes);
+	if (a.kv_scale_bytes > 0u) {
+		mmio_zero(a.ddr + a.off_k_scale, a.kv_scale_bytes);
+		mmio_zero(a.ddr + a.off_v_scale, a.kv_scale_bytes);
+	}
 	memset(&prof_acc, 0, sizeof(prof_acc));
 
 	uint32_t token = start_tok;
@@ -1397,11 +1561,11 @@ static int cmd_llama_verify(int argc, char **argv)
 		if (pos == 0u) {
 			printf("\n");
 			compare_vec("silicon_fnorm", dbg_x, g_fnorm, a.hdr.dim, &err, &cos_sim);
-			if (err > 5e-4f || cos_sim < 0.999999) {
+			if (a.kv_int8 ? (cos_sim < 0.97) : (err > 5e-4f || cos_sim < 0.999999)) {
 				fail = 1;
 			}
 			compare_vec("silicon_logits", logits, g_logits, a.hdr.vocab_size, &err, &cos_sim);
-			if (err > 5e-3f || cos_sim < 0.999999) {
+			if (a.kv_int8 ? (cos_sim < 0.97) : (err > 5e-3f || cos_sim < 0.999999)) {
 				fail = 1;
 			}
 			if (nxt != argmax_f32(logits, a.hdr.vocab_size)) {
@@ -1471,6 +1635,10 @@ static int cmd_llama_verify(int argc, char **argv)
 		}
 		mmio_zero(a.ddr + a.off_k_cache, a.kv_bytes);
 		mmio_zero(a.ddr + a.off_v_cache, a.kv_bytes);
+		if (a.kv_scale_bytes > 0u) {
+			mmio_zero(a.ddr + a.off_k_scale, a.kv_scale_bytes);
+			mmio_zero(a.ddr + a.off_v_scale, a.kv_scale_bytes);
+		}
 
 		if (arena_prefill_tokens(&a, pf_toks, pf_n, 0u, NULL, &pf_argmax,
 					 &pf_prof, &pf_wall_us) != 0) {
@@ -1516,6 +1684,7 @@ static int cmd_llama_run(int argc, char **argv)
 	uint32_t steps         = 128u;
 	float temp             = 0.0f;
 	float topp             = 0.9f;
+	int kv_mode            = -1; /* auto: int8 if seq_len >= 1024 */
 	int i                  = 4;
 
 	if (i < argc && argv[i][0] != '-') {
@@ -1532,13 +1701,17 @@ static int cmd_llama_run(int argc, char **argv)
 			topp = (float)atof(argv[++i]);
 		} else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
 			g_sample_rng = (uint64_t)strtoull(argv[++i], NULL, 10) | 1ull;
+		} else if (strcmp(argv[i], "--kv-int8") == 0) {
+			kv_mode = 1;
+		} else if (strcmp(argv[i], "--kv-fp32") == 0) {
+			kv_mode = 0;
 		}
 	}
 
 	struct llama_arena a;
 	struct tokenizer tok;
 
-	if (arena_load_model(&a, model_path) != 0) {
+	if (arena_load_model(&a, model_path, kv_mode) != 0) {
 		return 1;
 	}
 	if (a.embedded_tok) {
@@ -1561,12 +1734,15 @@ static int cmd_llama_run(int argc, char **argv)
 		steps = a.hdr.seq_len;
 	}
 
-	int prompt_tokens[512];
-	uint32_t pf_toks[512];
-	int n_prompt = tokenizer_encode(&tok, prompt, 1, 0, prompt_tokens, 512);
+	int *prompt_tokens = malloc(4096u * sizeof(int));
+	uint32_t *pf_toks  = malloc(4096u * sizeof(uint32_t));
+	int n_prompt = tokenizer_encode(&tok, prompt, 1, 0, prompt_tokens, 4096);
 	if (n_prompt <= 0) {
 		prompt_tokens[0] = (int)(a.hdr.bos_token_id ? a.hdr.bos_token_id : 1u);
 		n_prompt = 1;
+	}
+	if ((uint32_t)n_prompt > a.hdr.seq_len) {
+		n_prompt = (int)a.hdr.seq_len;
 	}
 	float *logits = malloc((size_t)a.hdr.vocab_size * sizeof(float));
 	struct c7x_llama_prof prof, prof_acc;
@@ -1615,15 +1791,18 @@ static int cmd_llama_run(int argc, char **argv)
 			(double)prof.cyc_swiglu / 1e6, (double)prof.cyc_ffn_down_mma / 1e6,
 			(double)prof.cyc_cls_mma / 1e6,
 			(double)(prof.cyc_rmsnorm + prof.cyc_quant) / 1e6);
+		uint32_t eos_id = a.hdr.eos_token_id ? a.hdr.eos_token_id : 2u;
 		uint32_t nxt = (temp > 0.0f)
 			       ? sample_topp(logits, a.hdr.vocab_size, temp, topp)
 			       : argmax;
-		if (nxt != (a.hdr.eos_token_id ? a.hdr.eos_token_id : 2u)) {
+		if (nxt == eos_id || (!tok.is_c7t && nxt == 1u)) {
+			pos = a.hdr.seq_len; /* stop immediately */
+		} else {
 			fputs(tokenizer_decode(&tok, (int)pf_toks[n_prompt - 1], (int)nxt), stdout);
 			fflush(stdout);
+			token = nxt;
+			pos = (uint32_t)n_prompt;
 		}
-		token = nxt;
-		pos = (uint32_t)n_prompt;
 		t0 = now_us();
 	}
 
@@ -1668,9 +1847,247 @@ static int cmd_llama_run(int argc, char **argv)
 		print_profile(&prof_acc, a.hdr.n_layers, decoded);
 	}
 
+	free(prompt_tokens);
+	free(pf_toks);
 	free(logits);
 	tokenizer_free(&tok);
 	arena_close(&a);
+	return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Subcommand: c7x-ai llama spec (lossless greedy speculative decoding)       */
+/* -------------------------------------------------------------------------- */
+
+static int cmd_llama_spec(int argc, char **argv)
+{
+	if (argc < 5) {
+		fprintf(stderr, "usage: c7x-ai llama spec <target.c7m> <draft.c7m> [-k draft_len] [-p prompt] [-n steps] [--kv-int8|--kv-fp32]\n");
+		return 2;
+	}
+	const char *target_path = argv[3];
+	const char *draft_path  = argv[4];
+	const char *prompt      = "";
+	uint32_t steps          = 64u;
+	uint32_t draft_k        = 4u;
+	int kv_mode             = -1;
+
+	for (int i = 5; i < argc; i++) {
+		if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			prompt = argv[++i];
+		} else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+			steps = (uint32_t)atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+			draft_k = (uint32_t)atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--kv-int8") == 0) {
+			kv_mode = 1;
+		} else if (strcmp(argv[i], "--kv-fp32") == 0) {
+			kv_mode = 0;
+		}
+	}
+	if (draft_k < 1u) draft_k = 1u;
+	if (draft_k > 16u) draft_k = 16u;
+
+	struct llama_arena tgt, drf;
+	struct tokenizer tok;
+
+	if (arena_load_model_at(&tgt, target_path, kv_mode, 0u, 1, 16u * 1024u * 1024u) != 0) {
+		return 1;
+	}
+	if (arena_load_model_at(&drf, draft_path, kv_mode, tgt.total_used, 0, 8u * 1024u * 1024u) != 0) {
+		arena_close(&tgt);
+		return 1;
+	}
+	if (tgt.hdr.vocab_size != drf.hdr.vocab_size) {
+		fprintf(stderr, "speculative decode requires matching vocab_size (%u != %u)\n",
+			tgt.hdr.vocab_size, drf.hdr.vocab_size);
+		arena_close(&drf);
+		arena_close(&tgt);
+		return 1;
+	}
+	if (!tgt.embedded_tok || tokenizer_load_c7t(&tok, tgt.embedded_tok, tgt.embedded_tok_size) != 0) {
+		fprintf(stderr, "target model requires embedded C7T1 tokenizer\n");
+		arena_close(&drf);
+		arena_close(&tgt);
+		return 1;
+	}
+
+	int *prompt_tokens = malloc(4096u * sizeof(int));
+	uint32_t *pf_toks  = malloc(4096u * sizeof(uint32_t));
+	int n_prompt = tokenizer_encode(&tok, prompt, 1, 0, prompt_tokens, 4096);
+	if (n_prompt <= 0) {
+		prompt_tokens[0] = (int)(tgt.hdr.bos_token_id ? tgt.hdr.bos_token_id : 1u);
+		n_prompt = 1;
+	}
+	uint32_t min_seq = tgt.hdr.seq_len < drf.hdr.seq_len ? tgt.hdr.seq_len : drf.hdr.seq_len;
+	if ((uint32_t)n_prompt >= min_seq) {
+		n_prompt = (int)min_seq - 1;
+	}
+	for (int i = 0; i < n_prompt; i++) {
+		pf_toks[i] = (uint32_t)prompt_tokens[i];
+		fputs(tokenizer_decode(&tok, 0, (int)pf_toks[i]), stdout);
+	}
+	fflush(stdout);
+
+	uint32_t eos_id = tgt.hdr.eos_token_id ? tgt.hdr.eos_token_id : 2u;
+	uint32_t cur_tok = 0u, dummy_arg = 0u;
+	struct c7x_llama_prof pf_prof;
+	double pf_wall = 0.0;
+
+	/* Prefill prompt on BOTH target and draft models */
+	if (arena_prefill_tokens(&tgt, pf_toks, (uint32_t)n_prompt, 0u, NULL, &cur_tok, &pf_prof, &pf_wall) != 0 ||
+	    arena_prefill_tokens(&drf, pf_toks, (uint32_t)n_prompt, 0u, NULL, &dummy_arg, NULL, NULL) != 0) {
+		fprintf(stderr, "prefill failed\n");
+		free(prompt_tokens);
+		free(pf_toks);
+		tokenizer_free(&tok);
+		arena_close(&drf);
+		arena_close(&tgt);
+		return 1;
+	}
+	fprintf(stderr, "\n[spec-prefill] %d prompt tokens on target in %.1f ms (%.1f tok/s)\n",
+		n_prompt, (double)pf_prof.cyc_total / 1e6, (double)n_prompt / ((double)pf_prof.cyc_total / 1e9));
+
+	uint32_t pos = (uint32_t)n_prompt;
+	uint32_t emitted = 0u;
+	uint32_t total_drafted = 0u, total_accepted = 0u, verify_calls = 0u;
+	double draft_ms = 0.0, verify_ms = 0.0;
+
+	if (cur_tok != eos_id) {
+		fputs(tokenizer_decode(&tok, (int)pf_toks[n_prompt - 1], (int)cur_tok), stdout);
+		fflush(stdout);
+		emitted++;
+	}
+
+	double t0 = now_us();
+	uint32_t cand[20], v_toks[20], t_arg[20];
+	int hit_eos = (cur_tok == eos_id);
+
+	while (!hit_eos && emitted < steps && pos + 2u < min_seq) {
+		uint32_t k_cur = draft_k;
+		if (pos + k_cur + 1u >= min_seq) {
+			k_cur = min_seq - pos - 2u;
+		}
+		if (emitted + k_cur + 1u > steps && steps > emitted) {
+			uint32_t rem = steps - emitted;
+			if (rem < k_cur) k_cur = rem;
+		}
+		if (k_cur == 0u) {
+			break;
+		}
+
+		/* 1. Draft k_cur candidate tokens with draft model starting from cur_tok at pos */
+		uint32_t dt = cur_tok;
+		uint32_t d_len = 0u;
+		struct c7x_llama_prof dp;
+		for (uint32_t j = 0u; j < k_cur; j++) {
+			uint32_t nxt = 0u;
+			if (arena_forward_token(&drf, dt, pos + j, NULL, &nxt, NULL, -1, 0u, &dp, NULL) != 0) {
+				hit_eos = 1;
+				break;
+			}
+			draft_ms += (double)dp.cyc_total / 1e6;
+			cand[d_len++] = nxt;
+			dt = nxt;
+			if (nxt == eos_id) {
+				break;
+			}
+		}
+		if (d_len == 0u) {
+			break;
+		}
+		total_drafted += d_len;
+
+		/* 2. Verify [cur_tok, cand[0..d_len-1]] in ONE batched target MMA prefill! */
+		v_toks[0] = cur_tok;
+		for (uint32_t j = 0u; j < d_len; j++) {
+			v_toks[j + 1u] = cand[j];
+		}
+		uint32_t v_n = d_len + 1u;
+		struct c7x_llama_prof vp;
+		if (arena_prefill_tokens_once(&tgt, v_toks, v_n, pos, C7X_LLAMA_REQ_ALL_ARGMAX,
+					      (float *)t_arg, NULL, &vp, NULL) != 0) {
+			fprintf(stderr, "\nspeculative target verify failed\n");
+			break;
+		}
+		verify_ms += (double)vp.cyc_total / 1e6;
+		verify_calls++;
+
+		/* 3. Exact lossless greedy acceptance + KV sync/rollback */
+		uint32_t acc = 0u;
+		uint32_t prev_t = cur_tok;
+		while (acc < d_len && t_arg[acc] == cand[acc]) {
+			uint32_t tok_ok = cand[acc];
+			total_accepted++;
+			if (tok_ok == eos_id) {
+				hit_eos = 1;
+				acc++;
+				break;
+			}
+			fputs(tokenizer_decode(&tok, (int)prev_t, (int)tok_ok), stdout);
+			fflush(stdout);
+			prev_t = tok_ok;
+			emitted++;
+			acc++;
+			if (emitted >= steps) {
+				break;
+			}
+		}
+
+		if (hit_eos || emitted >= steps) {
+			break;
+		}
+
+		if (acc == d_len) {
+			/* All drafted tokens accepted! Emit target's FREE bonus token t_arg[d_len]! */
+			uint32_t bonus = t_arg[d_len];
+			/* Sync draft KV at pos + d_len with cand[d_len - 1] so draft matches target */
+			if (arena_forward_token(&drf, cand[d_len - 1u], pos + d_len,
+						NULL, &dummy_arg, NULL, -1, 0u, &dp, NULL) == 0) {
+				draft_ms += (double)dp.cyc_total / 1e6;
+			}
+			pos += d_len + 1u;
+			cur_tok = bonus;
+			if (bonus == eos_id) {
+				hit_eos = 1;
+				break;
+			}
+			fputs(tokenizer_decode(&tok, (int)prev_t, (int)bonus), stdout);
+			fflush(stdout);
+			emitted++;
+		} else {
+			/* Rejected at cand[acc]: emit target's exact correction t_arg[acc] and roll back KV */
+			uint32_t corr = t_arg[acc];
+			pos += acc + 1u;
+			cur_tok = corr;
+			if (corr == eos_id) {
+				hit_eos = 1;
+				break;
+			}
+			fputs(tokenizer_decode(&tok, (int)prev_t, (int)corr), stdout);
+			fflush(stdout);
+			emitted++;
+		}
+	}
+
+	double elapsed_s = (now_us() - t0) / 1e6;
+	uint32_t gen_after_pf = (emitted > 1u) ? (emitted - 1u) : 0u;
+	printf("\n\n[spec] K=%u | emitted=%u tok (after prefill: %u) in %.3f s -> %.2f tok/s e2e\n",
+	       draft_k, emitted, gen_after_pf, elapsed_s,
+	       gen_after_pf ? ((double)gen_after_pf / elapsed_s) : 0.0);
+	printf("[spec] accept=%u/%u (%.1f%%) | mean_tok/step=%.2f | verify_calls=%u | draft=%.1f ms (%.1f ms/call) | target_verify=%.1f ms (%.1f ms/call)\n",
+	       total_accepted, total_drafted,
+	       total_drafted ? (100.0 * (double)total_accepted / (double)total_drafted) : 0.0,
+	       verify_calls ? ((double)gen_after_pf / (double)verify_calls) : 0.0,
+	       verify_calls,
+	       draft_ms, verify_calls ? (draft_ms / (double)verify_calls) : 0.0,
+	       verify_ms, verify_calls ? (verify_ms / (double)verify_calls) : 0.0);
+
+	free(prompt_tokens);
+	free(pf_toks);
+	tokenizer_free(&tok);
+	arena_close(&drf);
+	arena_close(&tgt);
 	return 0;
 }
 
@@ -1680,7 +2097,8 @@ int cmd_llama(int argc, char **argv)
 		fprintf(stderr,
 			"usage:\n"
 			"  c7x-ai llama verify <model.c7m> [tokenizer.bin] <golden.bin> [steps]\n"
-			"  c7x-ai llama run    <model.c7m> [tokenizer.bin] [-p prompt] [-n steps] [-t temp] [-P topp] [-s seed]\n");
+			"  c7x-ai llama run    <model.c7m> [tokenizer.bin] [-p prompt] [-n steps] [-t temp] [-P topp] [-s seed]\n"
+			"  c7x-ai llama spec   <target.c7m> <draft.c7m> [-k draft_len] [-p prompt] [-n steps]\n");
 		return 2;
 	}
 	if (strcmp(argv[2], "verify") == 0) {
@@ -1688,6 +2106,9 @@ int cmd_llama(int argc, char **argv)
 	}
 	if (strcmp(argv[2], "run") == 0) {
 		return cmd_llama_run(argc, argv);
+	}
+	if (strcmp(argv[2], "spec") == 0) {
+		return cmd_llama_spec(argc, argv);
 	}
 	fprintf(stderr, "unknown llama subcommand '%s'\n", argv[2]);
 	return 2;

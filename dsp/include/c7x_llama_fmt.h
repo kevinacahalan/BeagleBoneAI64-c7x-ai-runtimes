@@ -23,7 +23,8 @@
 #define C7M_FLAG_W4A8_WCLS     (1u << 2) /* Output classifier (wcls) in group-64 row-pair W4A8 */
 #define C7M_FLAG_HAS_QKV_BIAS  (1u << 3) /* Layers include float32 bq/bk/bv biases (Qwen2) */
 #define C7M_FLAG_UNTIED_EMB    (1u << 4) /* Separate int8 token_embedding_table at off_emb_q/s */
-#define C7M_FLAG_ROPE_NEOX     (1u << 5) /* Half-split NeoX RoPE (HF Llama/SmolLM/Qwen2) */
+#define C7M_FLAG_ROPE_NEOX     (1u << 5) /* Half-split NeoX RoPE (HF Llama/SmolLM/Qwen2/3) */
+#define C7M_FLAG_HAS_QK_NORM   (1u << 6) /* Layers include per-head float32 q_norm/k_norm (Qwen3) */
 
 /*
  * 256-byte (64B-aligned) header at offset 0 of a .c7m file.
@@ -69,8 +70,9 @@ struct c7m_header {
 	uint32_t tokenizer_size;   /* Byte length of embedded tokenizer blob */
 	uint32_t bos_token_id;     /* Model BOS token ID (0 -> default 1) */
 	uint32_t eos_token_id;     /* Model EOS token ID (0 -> default 2) */
+	uint32_t off_qknorm_table; /* struct c7m_layer_qknorm_offs[n_layers] (if HAS_QK_NORM) */
 
-	uint32_t reserved[31];     /* Zero-padded to 256 bytes */
+	uint32_t reserved[30];     /* Zero-padded to 256 bytes */
 };
 
 /*
@@ -99,10 +101,16 @@ struct c7m_layer_offs {
 
 /* Optional 16-byte bias offset entry per layer (when C7M_FLAG_HAS_QKV_BIAS is set). */
 struct c7m_layer_bias_offs {
-	uint32_t bq; /* float32[dim] (0 = none) */
+	uint32_t bq; /* float32[q_dim] (0 = none) */
 	uint32_t bk; /* float32[kv_dim] (0 = none) */
 	uint32_t bv; /* float32[kv_dim] (0 = none) */
 	uint32_t reserved;
+};
+
+/* Optional 8-byte QK-RMSNorm offset entry per layer (when C7M_FLAG_HAS_QK_NORM is set). */
+struct c7m_layer_qknorm_offs {
+	uint32_t q_norm; /* float32[head_size] (0 = none) */
+	uint32_t k_norm; /* float32[head_size] (0 = none) */
 };
 
 /*
@@ -125,14 +133,19 @@ struct c7x_llama_prof {
 	uint64_t cyc_layer[C7M_MAX_LAYERS];
 };
 
+/* Request flags for struct c7x_llama_req.flags */
+#define C7X_LLAMA_REQ_KV_INT8    (1u << 0) /* K/V caches are per-head-row symmetric INT8 + scales */
+#define C7X_LLAMA_REQ_ALL_LOGITS (1u << 1) /* Prefill: write logits for ALL n_tokens (speculative) */
+#define C7X_LLAMA_REQ_ALL_ARGMAX (1u << 2) /* Prefill: write uint32_t argmax[n_tokens] into logits_addr */
+
 /*
  * Request descriptor for C7X_OP_LLAMA_FORWARD / C7X_OP_LLAMA_PREFILL.
  */
 struct c7x_llama_req {
 	uint64_t model_addr;       /* Physical address of .c7m buffer in DDR */
-	uint64_t k_cache_addr;     /* Physical address of float32[n_layers][seq_len][kv_dim] */
-	uint64_t v_cache_addr;     /* Physical address of float32[n_layers][seq_len][kv_dim] */
-	uint64_t logits_addr;      /* Physical address of float32[vocab_size] output (0 = argmax only) */
+	uint64_t k_cache_addr;     /* float32 or int8_t[n_layers][seq_len][kv_dim] */
+	uint64_t v_cache_addr;     /* float32 or int8_t[n_layers][seq_len][kv_dim] */
+	uint64_t logits_addr;      /* float32[vocab_size] (or [n_tokens][vocab_size] if ALL_LOGITS) */
 	uint64_t prof_addr;        /* Optional physical address of struct c7x_llama_prof */
 	uint64_t debug_x_addr;     /* Optional physical address of float32[dim] layer output */
 	uint64_t msmc_layers_addr; /* Optional MSMC copy of layers 0..msmc_n_layers-1 */
@@ -145,7 +158,9 @@ struct c7x_llama_req {
 	uint64_t tokens_addr;      /* For prefill: uint32_t[n_tokens] in DDR */
 	uint64_t prefill_buf_addr; /* For prefill: DDR workspace for batched activations */
 	uint32_t prefill_buf_bytes;/* Byte size of prefill workspace */
-	uint32_t reserved1;
+	uint32_t flags;            /* C7X_LLAMA_REQ_* */
+	uint64_t k_scale_addr;     /* float32[n_layers][seq_len][n_kv_heads] (if KV_INT8) */
+	uint64_t v_scale_addr;     /* float32[n_layers][seq_len][n_kv_heads] (if KV_INT8) */
 };
 
 #endif /* C7X_LLAMA_FMT_H_ */

@@ -17,6 +17,14 @@ extern "C" {
 void c7x_rmsnorm_f32(float *out, const float *x, const float *weight,
 		     uint32_t n, float eps);
 
+/* Per-head in-place RMSNorm over vec[n_heads][head_size] using weight[head_size] (Qwen3 QK-norm). */
+void c7x_rmsnorm_heads_f32(float *vec, const float *weight,
+			   uint32_t n_heads, uint32_t head_size, float eps);
+
+/* Quantize one KV position [n_kv_heads][head_size] into symmetric per-head INT8 + float32 scales. */
+void c7x_kv_quant_store_i8(int8_t *dst_q, float *dst_s, const float *src,
+			   uint32_t n_kv_heads, uint32_t head_size);
+
 /*
  * Dynamic per-vector symmetric INT8 quantization:
  *   scale = max(|x[0..n-1]|) / 127.0f
@@ -73,6 +81,17 @@ void c7x_attn_mha_f32(float *out, const float *q,
 		      const float *k_cache_layer, const float *v_cache_layer,
 		      float *att_buf, uint32_t pos,
 		      uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_size);
+
+/*
+ * Causal multi-head attention against per-head-row symmetric INT8 KV cache:
+ *   k_q_layer, v_q_layer: int8_t[seq_len][kv_dim]
+ *   k_s_layer, v_s_layer: float32[seq_len][n_kv_heads]
+ */
+void c7x_attn_mha_i8_f32(float *out, const float *q,
+			 const int8_t *k_q_layer, const float *k_s_layer,
+			 const int8_t *v_q_layer, const float *v_s_layer,
+			 float *att_buf, uint32_t pos,
+			 uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_size);
 
 /* Run built-in self-test of all vector kernels against scalar references. Returns 0 on pass. */
 int c7x_vec_selftest(float *max_err_out);

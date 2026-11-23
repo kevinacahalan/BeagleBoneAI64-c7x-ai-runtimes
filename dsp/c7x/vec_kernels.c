@@ -69,6 +69,29 @@ static inline void se_open_2d_32b(int se, const void *p,
 	}
 }
 
+/* Open SE on a 2D 8-bit signed stream hardware-promoted to 16 x int32 (512-bit int16). */
+static inline void se_open_2d_i8_sext32(int se, const void *p,
+					uint32_t icnt0, uint32_t icnt1, int32_t dim1)
+{
+	__SE_FLAGS flags = __SE_FLAGS_default();
+	__STRM_TEMPLATE params = vec_strm_zero();
+
+	flags.DIMFMT  = __SE_DIMFMT_2D;
+	flags.ELETYPE = __SE_ELETYPE_8BIT;
+	flags.PROMOTE = __SE_PROMOTE_4X_SIGNEXT;
+	flags.VECLEN  = __SE_VECLEN_16ELEMS;
+
+	params = __set_ICNT0(params, icnt0);
+	params = __set_ICNT1_DIM1(params, icnt1, dim1);
+	params = __set_SE_FLAGS(params, &flags, NULL);
+
+	if (se) {
+		__SE1_OPEN(p, params);
+	} else {
+		__SE0_OPEN(p, params);
+	}
+}
+
 static inline float hsum_float16(float16 v)
 {
 	float tmp[16] __attribute__((aligned(64)));
@@ -106,8 +129,9 @@ static inline float hmax_float16(float16 v)
  */
 static inline float16 vexpf_f16(float16 x)
 {
+	/* Clamp to +/-87.3365 so k stays in [-126, +126] (finite pow2k; avoids +Inf -> 0*Inf=NaN in vrecip_f16!). */
 	const float16 c_lo    = (float16)(-87.33654475f);
-	const float16 c_hi    = (float16)(88.72283905f);
+	const float16 c_hi    = (float16)(87.33654475f);
 	const float16 inv_ln2 = (float16)(1.4426950408889634f);
 	const float16 ln2_hi  = (float16)(0.693359375f);
 	const float16 ln2_lo  = (float16)(-2.12194440e-4f);
@@ -189,6 +213,58 @@ void c7x_rmsnorm_f32(float *out, const float *x, const float *weight,
 	}
 	for (; i < n; i++) {
 		out[i] = (x[i] * inv) * weight[i];
+	}
+}
+
+void c7x_rmsnorm_heads_f32(float *vec, const float *weight,
+			   uint32_t n_heads, uint32_t head_size, float eps)
+{
+	uint32_t h, i;
+	uint32_t n_vec = head_size & ~15u;
+	float inv_hd = 1.0f / (float)head_size;
+
+	/*
+	 * Keep register pressure low (2-pass 16-wide vector loop) so cl7x 1.2.0.STS
+	 * never spills vector registers or mis-schedules D0 address reloads.
+	 */
+	for (h = 0u; h < n_heads; h++) {
+		float *vh = vec + h * head_size;
+		float16 ss_v = (float16)0.0f;
+		float ss, inv;
+		float16 inv_v;
+
+		for (i = 0u; i < n_vec; i += 16u) {
+			float16 xv = *(__float16_ptr)&vh[i];
+
+			ss_v += xv * xv;
+		}
+		ss = hsum_float16(ss_v);
+		for (; i < head_size; i++) {
+			ss += vh[i] * vh[i];
+		}
+		inv = 1.0f / sqrtf(ss * inv_hd + eps);
+		inv_v = (float16)inv;
+
+		for (i = 0u; i < n_vec; i += 16u) {
+			float16 xv = *(__float16_ptr)&vh[i];
+			float16 wv = *(__float16_ptr)(float *)&weight[i];
+
+			*(__float16_ptr)&vh[i] = (xv * inv_v) * wv;
+		}
+		for (; i < head_size; i++) {
+			vh[i] = (vh[i] * inv) * weight[i];
+		}
+	}
+}
+
+void c7x_kv_quant_store_i8(int8_t *dst_q, float *dst_s, const float *src,
+			   uint32_t n_kv_heads, uint32_t head_size)
+{
+	uint32_t h;
+
+	for (h = 0u; h < n_kv_heads; h++) {
+		c7x_quantize_f32_i8(dst_q + h * head_size, src + h * head_size,
+				    head_size, head_size, &dst_s[h]);
 	}
 }
 
@@ -679,6 +755,70 @@ void c7x_attn_mha_f32(float *out, const float *q,
 		return;
 	}
 
+	/* Fast hardware-prefetched 2D SE0/SE1 path for head_size == 128 (Qwen3, Qwen2.5-1.5B, Llama3). */
+	if (head_size == 128u) {
+		for (h = 0u; h < n_heads; h++) {
+			const float *qh = q + h * 128u;
+			float *oh = out + h * 128u;
+			uint32_t kvh_off = (h / kv_mul) * 128u;
+			float16 q0 = *(__float16_ptr)(float *)&qh[0];
+			float16 q1 = *(__float16_ptr)(float *)&qh[16];
+			float16 q2 = *(__float16_ptr)(float *)&qh[32];
+			float16 q3 = *(__float16_ptr)(float *)&qh[48];
+			float16 q4 = *(__float16_ptr)(float *)&qh[64];
+			float16 q5 = *(__float16_ptr)(float *)&qh[80];
+			float16 q6 = *(__float16_ptr)(float *)&qh[96];
+			float16 q7 = *(__float16_ptr)(float *)&qh[112];
+			float16 o0 = (float16)0.0f, o1 = (float16)0.0f;
+			float16 o2 = (float16)0.0f, o3 = (float16)0.0f;
+			float16 o4 = (float16)0.0f, o5 = (float16)0.0f;
+			float16 o6 = (float16)0.0f, o7 = (float16)0.0f;
+
+			se_open_2d_32b(0, k_cache_layer + kvh_off, 128u, n_pos, (int32_t)kv_dim);
+			se_open_2d_32b(1, v_cache_layer + kvh_off, 128u, n_pos, (int32_t)kv_dim);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 a0 = q0 * __SE0ADV(float16);
+				float16 a1 = q1 * __SE0ADV(float16);
+
+				a0 += q2 * __SE0ADV(float16);
+				a1 += q3 * __SE0ADV(float16);
+				a0 += q4 * __SE0ADV(float16);
+				a1 += q5 * __SE0ADV(float16);
+				a0 += q6 * __SE0ADV(float16);
+				a1 += q7 * __SE0ADV(float16);
+				att_buf[t] = hsum_float16(a0 + a1) * inv_sqrt_hd;
+			}
+			__SE0_CLOSE();
+
+			c7x_softmax_f32(att_buf, n_pos);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 av = (float16)att_buf[t];
+
+				o0 += av * __SE1ADV(float16);
+				o1 += av * __SE1ADV(float16);
+				o2 += av * __SE1ADV(float16);
+				o3 += av * __SE1ADV(float16);
+				o4 += av * __SE1ADV(float16);
+				o5 += av * __SE1ADV(float16);
+				o6 += av * __SE1ADV(float16);
+				o7 += av * __SE1ADV(float16);
+			}
+			__SE1_CLOSE();
+
+			*(__float16_ptr)&oh[0]   = o0;
+			*(__float16_ptr)&oh[16]  = o1;
+			*(__float16_ptr)&oh[32]  = o2;
+			*(__float16_ptr)&oh[48]  = o3;
+			*(__float16_ptr)&oh[64]  = o4;
+			*(__float16_ptr)&oh[80]  = o5;
+			*(__float16_ptr)&oh[96]  = o6;
+			*(__float16_ptr)&oh[112] = o7;
+		}
+		return;
+	}
+
 	/* Hardware-prefetched 2D SE0/SE1 path for any head_size multiple of 16 (e.g. 96, 128). */
 	if ((head_size % 16u) == 0u && head_size <= 256u) {
 		uint32_t n_v = head_size >> 4;
@@ -769,6 +909,245 @@ void c7x_attn_mha_f32(float *out, const float *q,
 			}
 			for (; i < head_size; i++) {
 				oh[i] += a * vt[i];
+			}
+		}
+	}
+}
+
+void c7x_attn_mha_i8_f32(float *out, const float *q,
+			 const int8_t *k_q_layer, const float *k_s_layer,
+			 const int8_t *v_q_layer, const float *v_s_layer,
+			 float *att_buf, uint32_t pos,
+			 uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_size)
+{
+	uint32_t kv_dim = n_kv_heads * head_size;
+	uint32_t kv_mul = n_heads / n_kv_heads;
+	float inv_sqrt_hd = 1.0f / sqrtf((float)head_size);
+	uint32_t n_pos = pos + 1u;
+	uint32_t h, t, i;
+
+	if (head_size == 48u) {
+		for (h = 0u; h < n_heads; h++) {
+			const float *qh = q + h * 48u;
+			float *oh = out + h * 48u;
+			uint32_t kvh = h / kv_mul;
+			uint32_t kvh_off = kvh * 48u;
+			float16 q0 = *(__float16_ptr)(float *)&qh[0];
+			float16 q1 = *(__float16_ptr)(float *)&qh[16];
+			float16 q2 = *(__float16_ptr)(float *)&qh[32];
+			float16 o0 = (float16)0.0f, o1 = (float16)0.0f, o2 = (float16)0.0f;
+
+			se_open_2d_i8_sext32(0, k_q_layer + kvh_off, 48u, n_pos, (int32_t)kv_dim);
+			se_open_2d_i8_sext32(1, v_q_layer + kvh_off, 48u, n_pos, (int32_t)kv_dim);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 acc = q0 * __int_to_float(__SE0ADV(int16));
+
+				acc += q1 * __int_to_float(__SE0ADV(int16));
+				acc += q2 * __int_to_float(__SE0ADV(int16));
+				att_buf[t] = hsum_float16(acc) * (k_s_layer[(size_t)t * n_kv_heads + kvh] * inv_sqrt_hd);
+			}
+			__SE0_CLOSE();
+
+			c7x_softmax_f32(att_buf, n_pos);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 av = (float16)(att_buf[t] * v_s_layer[(size_t)t * n_kv_heads + kvh]);
+
+				o0 += av * __int_to_float(__SE1ADV(int16));
+				o1 += av * __int_to_float(__SE1ADV(int16));
+				o2 += av * __int_to_float(__SE1ADV(int16));
+			}
+			__SE1_CLOSE();
+
+			*(__float16_ptr)&oh[0]  = o0;
+			*(__float16_ptr)&oh[16] = o1;
+			*(__float16_ptr)&oh[32] = o2;
+		}
+		return;
+	}
+
+	if (head_size == 64u) {
+		for (h = 0u; h < n_heads; h++) {
+			const float *qh = q + h * 64u;
+			float *oh = out + h * 64u;
+			uint32_t kvh = h / kv_mul;
+			uint32_t kvh_off = kvh * 64u;
+			float16 q0 = *(__float16_ptr)(float *)&qh[0];
+			float16 q1 = *(__float16_ptr)(float *)&qh[16];
+			float16 q2 = *(__float16_ptr)(float *)&qh[32];
+			float16 q3 = *(__float16_ptr)(float *)&qh[48];
+			float16 o0 = (float16)0.0f, o1 = (float16)0.0f;
+			float16 o2 = (float16)0.0f, o3 = (float16)0.0f;
+
+			se_open_2d_i8_sext32(0, k_q_layer + kvh_off, 64u, n_pos, (int32_t)kv_dim);
+			se_open_2d_i8_sext32(1, v_q_layer + kvh_off, 64u, n_pos, (int32_t)kv_dim);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 acc = q0 * __int_to_float(__SE0ADV(int16));
+
+				acc += q1 * __int_to_float(__SE0ADV(int16));
+				acc += q2 * __int_to_float(__SE0ADV(int16));
+				acc += q3 * __int_to_float(__SE0ADV(int16));
+				att_buf[t] = hsum_float16(acc) * (k_s_layer[(size_t)t * n_kv_heads + kvh] * inv_sqrt_hd);
+			}
+			__SE0_CLOSE();
+
+			c7x_softmax_f32(att_buf, n_pos);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 av = (float16)(att_buf[t] * v_s_layer[(size_t)t * n_kv_heads + kvh]);
+
+				o0 += av * __int_to_float(__SE1ADV(int16));
+				o1 += av * __int_to_float(__SE1ADV(int16));
+				o2 += av * __int_to_float(__SE1ADV(int16));
+				o3 += av * __int_to_float(__SE1ADV(int16));
+			}
+			__SE1_CLOSE();
+
+			*(__float16_ptr)&oh[0]  = o0;
+			*(__float16_ptr)&oh[16] = o1;
+			*(__float16_ptr)&oh[32] = o2;
+			*(__float16_ptr)&oh[48] = o3;
+		}
+		return;
+	}
+
+	if (head_size == 128u) {
+		for (h = 0u; h < n_heads; h++) {
+			const float *qh = q + h * 128u;
+			float *oh = out + h * 128u;
+			uint32_t kvh = h / kv_mul;
+			uint32_t kvh_off = kvh * 128u;
+			float16 q0 = *(__float16_ptr)(float *)&qh[0];
+			float16 q1 = *(__float16_ptr)(float *)&qh[16];
+			float16 q2 = *(__float16_ptr)(float *)&qh[32];
+			float16 q3 = *(__float16_ptr)(float *)&qh[48];
+			float16 q4 = *(__float16_ptr)(float *)&qh[64];
+			float16 q5 = *(__float16_ptr)(float *)&qh[80];
+			float16 q6 = *(__float16_ptr)(float *)&qh[96];
+			float16 q7 = *(__float16_ptr)(float *)&qh[112];
+			float16 o0 = (float16)0.0f, o1 = (float16)0.0f;
+			float16 o2 = (float16)0.0f, o3 = (float16)0.0f;
+			float16 o4 = (float16)0.0f, o5 = (float16)0.0f;
+			float16 o6 = (float16)0.0f, o7 = (float16)0.0f;
+
+			se_open_2d_i8_sext32(0, k_q_layer + kvh_off, 128u, n_pos, (int32_t)kv_dim);
+			se_open_2d_i8_sext32(1, v_q_layer + kvh_off, 128u, n_pos, (int32_t)kv_dim);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 a0 = q0 * __int_to_float(__SE0ADV(int16));
+				float16 a1 = q1 * __int_to_float(__SE0ADV(int16));
+
+				a0 += q2 * __int_to_float(__SE0ADV(int16));
+				a1 += q3 * __int_to_float(__SE0ADV(int16));
+				a0 += q4 * __int_to_float(__SE0ADV(int16));
+				a1 += q5 * __int_to_float(__SE0ADV(int16));
+				a0 += q6 * __int_to_float(__SE0ADV(int16));
+				a1 += q7 * __int_to_float(__SE0ADV(int16));
+				att_buf[t] = hsum_float16(a0 + a1) * (k_s_layer[(size_t)t * n_kv_heads + kvh] * inv_sqrt_hd);
+			}
+			__SE0_CLOSE();
+
+			c7x_softmax_f32(att_buf, n_pos);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 av = (float16)(att_buf[t] * v_s_layer[(size_t)t * n_kv_heads + kvh]);
+
+				o0 += av * __int_to_float(__SE1ADV(int16));
+				o1 += av * __int_to_float(__SE1ADV(int16));
+				o2 += av * __int_to_float(__SE1ADV(int16));
+				o3 += av * __int_to_float(__SE1ADV(int16));
+				o4 += av * __int_to_float(__SE1ADV(int16));
+				o5 += av * __int_to_float(__SE1ADV(int16));
+				o6 += av * __int_to_float(__SE1ADV(int16));
+				o7 += av * __int_to_float(__SE1ADV(int16));
+			}
+			__SE1_CLOSE();
+
+			*(__float16_ptr)&oh[0]   = o0;
+			*(__float16_ptr)&oh[16]  = o1;
+			*(__float16_ptr)&oh[32]  = o2;
+			*(__float16_ptr)&oh[48]  = o3;
+			*(__float16_ptr)&oh[64]  = o4;
+			*(__float16_ptr)&oh[80]  = o5;
+			*(__float16_ptr)&oh[96]  = o6;
+			*(__float16_ptr)&oh[112] = o7;
+		}
+		return;
+	}
+
+	if ((head_size % 16u) == 0u && head_size <= 256u) {
+		uint32_t n_v = head_size >> 4;
+
+		for (h = 0u; h < n_heads; h++) {
+			const float *qh = q + h * head_size;
+			float *oh = out + h * head_size;
+			uint32_t kvh = h / kv_mul;
+			uint32_t kvh_off = kvh * head_size;
+			float16 o_regs[16];
+			uint32_t v;
+
+			for (v = 0u; v < n_v; v++) {
+				o_regs[v] = (float16)0.0f;
+			}
+			se_open_2d_i8_sext32(0, k_q_layer + kvh_off, head_size, n_pos, (int32_t)kv_dim);
+			se_open_2d_i8_sext32(1, v_q_layer + kvh_off, head_size, n_pos, (int32_t)kv_dim);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 acc = (float16)0.0f;
+
+				for (v = 0u; v < n_v; v++) {
+					float16 qv = *(__float16_ptr)(float *)&qh[v << 4];
+
+					acc += qv * __int_to_float(__SE0ADV(int16));
+				}
+				att_buf[t] = hsum_float16(acc) * (k_s_layer[(size_t)t * n_kv_heads + kvh] * inv_sqrt_hd);
+			}
+			__SE0_CLOSE();
+
+			c7x_softmax_f32(att_buf, n_pos);
+
+			for (t = 0u; t < n_pos; t++) {
+				float16 av = (float16)(att_buf[t] * v_s_layer[(size_t)t * n_kv_heads + kvh]);
+
+				for (v = 0u; v < n_v; v++) {
+					o_regs[v] += av * __int_to_float(__SE1ADV(int16));
+				}
+			}
+			__SE1_CLOSE();
+
+			for (v = 0u; v < n_v; v++) {
+				*(__float16_ptr)&oh[v << 4] = o_regs[v];
+			}
+		}
+		return;
+	}
+
+	/* Generic scalar fallback */
+	for (h = 0u; h < n_heads; h++) {
+		const float *qh = q + h * head_size;
+		float *oh = out + h * head_size;
+		uint32_t kvh = h / kv_mul;
+		uint32_t kvh_off = kvh * head_size;
+
+		for (t = 0u; t < n_pos; t++) {
+			const int8_t *kt = k_q_layer + (size_t)t * kv_dim + kvh_off;
+			float score = 0.0f;
+
+			for (i = 0u; i < head_size; i++) {
+				score += qh[i] * (float)kt[i];
+			}
+			att_buf[t] = score * (k_s_layer[(size_t)t * n_kv_heads + kvh] * inv_sqrt_hd);
+		}
+		c7x_softmax_f32(att_buf, n_pos);
+		memset(oh, 0, head_size * sizeof(float));
+		for (t = 0u; t < n_pos; t++) {
+			const int8_t *vt = v_q_layer + (size_t)t * kv_dim + kvh_off;
+			float a = att_buf[t] * v_s_layer[(size_t)t * n_kv_heads + kvh];
+
+			for (i = 0u; i < head_size; i++) {
+				oh[i] += a * (float)vt[i];
 			}
 		}
 	}
@@ -908,7 +1287,7 @@ int c7x_vec_selftest(float *max_err_out)
 		}
 	}
 
-	/* 6. Vector SwiGLU (exercises vexpf_f16 and vrecip_f16) */
+	/* 6. Vector SwiGLU (exercises vexpf_f16 and vrecip_f16, incl. negative gate outliers < -88.7) */
 	c7x_swiglu_f32(y, x, w, 288u);
 	for (i = 0u; i < 288u; i++) {
 		float ref = (x[i] / (1.0f + expf(-x[i]))) * w[i];
@@ -916,6 +1295,23 @@ int c7x_vec_selftest(float *max_err_out)
 
 		if (e > max_err) {
 			max_err = e;
+		}
+	}
+	{
+		static float sg_a[16] __attribute__((aligned(64)));
+		static float sg_b[16] __attribute__((aligned(64)));
+		static float sg_o[16] __attribute__((aligned(64)));
+
+		for (i = 0u; i < 16u; i++) {
+			sg_a[i] = -200.0f + (float)i * 25.0f;
+			sg_b[i] = 1.5f;
+		}
+		c7x_swiglu_f32(sg_o, sg_a, sg_b, 16u);
+		if (!(sg_o[0] == sg_o[0]) || fabsf(sg_o[0]) > 1e-6f) {
+			if (max_err_out) {
+				*max_err_out = 999.0f;
+			}
+			return -9;
 		}
 	}
 
@@ -935,6 +1331,98 @@ int c7x_vec_selftest(float *max_err_out)
 		}
 		if (got_idx != want_idx) {
 			return -6;
+		}
+	}
+
+	/* 8. Per-head QK-RMSNorm (n_heads=4, head_size=128) */
+	{
+		static float qh[4u * 128u] __attribute__((aligned(64)));
+		static float qh_ref[4u * 128u] __attribute__((aligned(64)));
+		static float qnw[128u] __attribute__((aligned(64)));
+		uint32_t h, j;
+
+		for (j = 0u; j < 128u; j++) {
+			qnw[j] = 0.5f + (float)((j * 29u + 7u) % 97u) * 0.5f;
+		}
+		for (h = 0u; h < 4u; h++) {
+			for (j = 0u; j < 128u; j++) {
+				int32_t v = (int32_t)(((h * 131u + j * 43u + 17u) % 201u)) - 100;
+				qh[h * 128u + j] = (float)v * 0.05f;
+				qh_ref[h * 128u + j] = qh[h * 128u + j];
+			}
+		}
+		c7x_rmsnorm_heads_f32(qh, qnw, 4u, 128u, 1e-6f);
+		for (h = 0u; h < 4u; h++) {
+			float ss = 0.0f, inv;
+
+			for (j = 0u; j < 128u; j++) {
+				ss += qh_ref[h * 128u + j] * qh_ref[h * 128u + j];
+			}
+			inv = 1.0f / sqrtf(ss / 128.0f + 1e-6f);
+			for (j = 0u; j < 128u; j++) {
+				float ref = (qh_ref[h * 128u + j] * inv) * qnw[j];
+				float e = fabsf(qh[h * 128u + j] - ref);
+
+				if (e > 1e-3f) {
+					if (max_err_out) {
+						*max_err_out = e;
+					}
+					return -7;
+				}
+			}
+		}
+	}
+
+	/* 9. NeoX RoPE + GQA Attention (head_size=128, pos=24) */
+	{
+		static float qa[4u * 128u] __attribute__((aligned(64)));
+		static float ka[25u * 2u * 128u] __attribute__((aligned(64)));
+		static float va[25u * 2u * 128u] __attribute__((aligned(64)));
+		static float oa[4u * 128u] __attribute__((aligned(64)));
+		static float att_t[64u] __attribute__((aligned(64)));
+		static float att_r[25u];
+		uint32_t h, t, j;
+
+		for (j = 0u; j < 4u * 128u; j++) {
+			qa[j] = ((float)((int32_t)((j * 17u + 3u) % 41u) - 20)) * 0.05f;
+		}
+		for (t = 0u; t < 25u; t++) {
+			for (j = 0u; j < 2u * 128u; j++) {
+				ka[t * 256u + j] = ((float)((int32_t)(((t * 31u + j * 13u) % 41u)) - 20)) * 0.05f;
+				va[t * 256u + j] = ((float)((int32_t)(((t * 19u + j * 23u) % 41u)) - 20)) * 0.05f;
+			}
+		}
+		c7x_attn_mha_f32(oa, qa, ka, va, att_t, 24u, 4u, 2u, 128u);
+		for (h = 0u; h < 4u; h++) {
+			uint32_t kvh = (h / 2u) * 128u;
+			float mx = -1e30f, sm = 0.0f;
+			float inv_hd = 1.0f / sqrtf(128.0f);
+
+			for (t = 0u; t < 25u; t++) {
+				float d = 0.0f;
+				for (j = 0u; j < 128u; j++) {
+					d += qa[h * 128u + j] * ka[t * 256u + kvh + j];
+				}
+				att_r[t] = d * inv_hd;
+				if (att_r[t] > mx) mx = att_r[t];
+			}
+			for (t = 0u; t < 25u; t++) {
+				att_r[t] = expf(att_r[t] - mx);
+				sm += att_r[t];
+			}
+			for (j = 0u; j < 128u; j++) {
+				float oref = 0.0f;
+				for (t = 0u; t < 25u; t++) {
+					oref += (att_r[t] / sm) * va[t * 256u + kvh + j];
+				}
+				float e = fabsf(oa[h * 128u + j] - oref);
+				if (e > 1e-4f) {
+					if (max_err_out) {
+						*max_err_out = e;
+					}
+					return -8;
+				}
+			}
 		}
 	}
 

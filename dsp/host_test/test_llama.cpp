@@ -107,7 +107,8 @@ int main(int argc, char **argv)
 	}
 
 	const uint32_t *gh = (const uint32_t *)golden_buf;
-	if (gh[0] != 0x31444C47u) {
+	int is_gld2 = (gh[0] == 0x32444C47u);
+	if (gh[0] != 0x31444C47u && !is_gld2) {
 		fprintf(stderr, "invalid golden magic 0x%08x\n", gh[0]);
 		return 1;
 	}
@@ -115,6 +116,7 @@ int main(int argc, char **argv)
 	uint32_t g_vocab = gh[2];
 	uint32_t g_steps = gh[3];
 	uint32_t start_tok = gh[4];
+	uint32_t g_nprompt = is_gld2 ? gh[5] : 1u;
 	if (g_dim != hdr->dim || g_vocab != hdr->vocab_size) {
 		fprintf(stderr, "golden dimensions mismatch\n");
 		return 1;
@@ -123,7 +125,7 @@ int main(int argc, char **argv)
 		steps = g_steps;
 	}
 
-	const uint32_t *g_tokens = (const uint32_t *)(golden_buf + 20u);
+	const uint32_t *g_tokens = (const uint32_t *)(golden_buf + (is_gld2 ? 24u : 20u));
 	const float *g_l0 = (const float *)(g_tokens + g_steps);
 	const float *g_last = g_l0 + g_dim;
 	const float *g_fnorm = g_last + g_dim;
@@ -141,8 +143,8 @@ int main(int argc, char **argv)
 	double cos_sim = 0.0;
 
 	/* 1. Single decoder layer verification (layer 0, pos = 0) */
-	if (c7x_llama_forward_token(hdr, start_tok, 0u, k_cache, v_cache, NULL, NULL,
-				    scratch, 444u * 1024u, NULL, 0u, NULL, dbg_x, 0, 1u) != 0) {
+	if (c7x_llama_forward_token(hdr, start_tok, 0u, k_cache, v_cache, NULL, NULL, 0u,
+				    NULL, NULL, scratch, 444u * 1024u, NULL, 0u, NULL, dbg_x, 0, 1u) != 0) {
 		fprintf(stderr, "single-layer forward failed\n");
 		return 1;
 	}
@@ -156,10 +158,10 @@ int main(int argc, char **argv)
 	memset(k_cache, 0, kv_bytes);
 	memset(v_cache, 0, kv_bytes);
 	uint32_t tok = start_tok;
-	uint32_t tok_matches = 0u;
+	uint32_t tok_matches = 0u, gen_checked = 0u;
 	for (uint32_t pos = 0u; pos < steps; pos++) {
 		uint32_t argmax = 0u;
-		int rc = c7x_llama_forward_token(hdr, tok, pos, k_cache, v_cache,
+		int rc = c7x_llama_forward_token(hdr, tok, pos, k_cache, v_cache, NULL, NULL, 0u,
 						 (pos == 0u) ? logits : NULL, &argmax,
 						 scratch, 444u * 1024u, NULL, 0u, NULL,
 						 (pos == 0u) ? dbg_x : NULL, -1, 0u);
@@ -184,12 +186,17 @@ int main(int argc, char **argv)
 			}
 		}
 		uint32_t nxt = argmax;
-		if (nxt == g_tokens[pos]) {
-			tok_matches++;
+		if (pos + 1u < g_nprompt) {
+			nxt = g_tokens[pos];
 		} else {
-			fprintf(stderr, "FAIL: pos=%u token got=%u want=%u\n",
-				pos, nxt, g_tokens[pos]);
-			fail = 1;
+			gen_checked++;
+			if (nxt == g_tokens[pos]) {
+				tok_matches++;
+			} else {
+				fprintf(stderr, "FAIL: pos=%u token got=%u want=%u\n",
+					pos, nxt, g_tokens[pos]);
+				fail = 1;
+			}
 		}
 		printf("[host-llama] pos=%u in=%u -> out=%u (want=%u)\n",
 		       pos, tok, nxt, g_tokens[pos]);
@@ -197,14 +204,17 @@ int main(int argc, char **argv)
 	}
 
 	printf("[host-llama] greedy token match: %u/%u -> %s\n",
-	       tok_matches, steps, fail ? "FAILED" : "PASS");
+	       tok_matches, gen_checked, fail ? "FAILED" : "PASS");
 
-	/* 3. Batched prefill verification (matches token-by-token next token) */
+	/* 3. Batched prefill verification (FP32 KV & INT8 KV) */
 	if (steps >= 4u) {
-		uint32_t pf_toks[16];
-		uint32_t pf_n = steps < 8u ? steps : 8u;
-		uint32_t pf_argmax = 0u;
-		void *pf_buf = alloc_aligned64(2u * 1024u * 1024u);
+		uint32_t pf_toks[32];
+		uint32_t pf_n = is_gld2 ? g_nprompt : (steps < 8u ? steps : 8u);
+		if (pf_n > 32u) pf_n = 32u;
+		uint32_t pf_argmax = 0u, pf_argmax_i8 = 0u;
+		void *pf_buf = alloc_aligned64(8u * 1024u * 1024u);
+		float *pf_logits_f32 = (float *)alloc_aligned64(hdr->vocab_size * sizeof(float));
+		float *pf_logits_i8  = (float *)alloc_aligned64(hdr->vocab_size * sizeof(float));
 
 		pf_toks[0] = start_tok;
 		for (uint32_t i = 1u; i < pf_n; i++) {
@@ -212,15 +222,36 @@ int main(int argc, char **argv)
 		}
 		memset(k_cache, 0, kv_bytes);
 		memset(v_cache, 0, kv_bytes);
-		int rc = c7x_llama_prefill_tokens(hdr, pf_toks, pf_n, 0u, k_cache, v_cache,
-						  NULL, &pf_argmax, scratch, 444u * 1024u,
-						  pf_buf, 2u * 1024u * 1024u, NULL, 0u, NULL);
+		int rc = c7x_llama_prefill_tokens(hdr, pf_toks, pf_n, 0u, k_cache, v_cache, NULL, NULL, 0u,
+						  pf_logits_f32, &pf_argmax, scratch, 444u * 1024u,
+						  pf_buf, 8u * 1024u * 1024u, NULL, 0u, NULL);
 		int pf_ok = (rc == 0 && pf_argmax == g_tokens[pf_n - 1u]);
-		printf("[host-llama] batched prefill (%u tok): rc=%d next=%u want=%u -> %s\n",
+		printf("[host-llama] batched prefill FP32-KV (%u tok): rc=%d next=%u want=%u -> %s\n",
 		       pf_n, rc, pf_argmax, g_tokens[pf_n - 1u], pf_ok ? "PASS" : "FAIL");
 		if (!pf_ok) {
 			fail = 1;
 		}
+
+		/* INT8 KV prefill comparison vs FP32 KV */
+		size_t kv_i8_bytes = (size_t)hdr->n_layers * hdr->seq_len * hdr->kv_dim;
+		size_t kv_sc_bytes = (size_t)hdr->n_layers * hdr->seq_len * hdr->n_kv_heads * sizeof(float);
+		int8_t *kq = (int8_t *)alloc_aligned64(kv_i8_bytes);
+		int8_t *vq = (int8_t *)alloc_aligned64(kv_i8_bytes);
+		float *ks = (float *)alloc_aligned64(kv_sc_bytes);
+		float *vs = (float *)alloc_aligned64(kv_sc_bytes);
+		int rc2 = c7x_llama_prefill_tokens(hdr, pf_toks, pf_n, 0u, kq, vq, ks, vs,
+						   C7X_LLAMA_REQ_KV_INT8,
+						   pf_logits_i8, &pf_argmax_i8, scratch, 444u * 1024u,
+						   pf_buf, 8u * 1024u * 1024u, NULL, 0u, NULL);
+		compare_vec("kv_i8_logits", pf_logits_i8, pf_logits_f32, hdr->vocab_size, &err, &cos_sim);
+		int i8_ok = (rc2 == 0 && cos_sim >= 0.999);
+		printf("[host-llama] batched prefill INT8-KV (%u tok): rc=%d next=%u want=%u -> %s\n",
+		       pf_n, rc2, pf_argmax_i8, g_tokens[pf_n - 1u], i8_ok ? "PASS" : "FAIL");
+		if (!i8_ok) {
+			fail = 1;
+		}
+		free(kq); free(vq); free(ks); free(vs);
+		free(pf_logits_f32); free(pf_logits_i8);
 		free(pf_buf);
 	}
 

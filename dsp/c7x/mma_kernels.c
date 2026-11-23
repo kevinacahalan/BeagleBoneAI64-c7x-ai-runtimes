@@ -854,50 +854,81 @@ static void mma_gemv_w4a8_g64_m1_chunk(float *out, const int8_t *a, float a_scal
  */
 static void store_tile_acc_w4(float *out_blk, const float *tile_acc_buf,
 			      const float *a_scales_blk, uint32_t m_cur,
-			      uint32_t col0, uint32_t out_dim, int add)
+			      uint32_t col0, uint32_t out_dim, int add,
+			      uint32_t *argmax_blk, float *best_val_blk)
 {
 	uint32_t r;
 
-	if (col0 + 64u <= out_dim) {
-		if (add) {
-			for (r = 0u; r < m_cur; r++) {
-				const float *src = tile_acc_buf + (r << 6);
-				float *dst = out_blk + (size_t)r * out_dim + col0;
-				float16 as_v = (float16)a_scales_blk[r];
+	if (out_blk) {
+		if (col0 + 64u <= out_dim) {
+			if (add) {
+				for (r = 0u; r < m_cur; r++) {
+					const float *src = tile_acc_buf + (r << 6);
+					float *dst = out_blk + (size_t)r * out_dim + col0;
+					float16 as_v = (float16)a_scales_blk[r];
 
-				*(__float16_ptr)(dst + 0u)  += *(__float16_ptr)(float *)(src + 0u)  * as_v;
-				*(__float16_ptr)(dst + 16u) += *(__float16_ptr)(float *)(src + 16u) * as_v;
-				*(__float16_ptr)(dst + 32u) += *(__float16_ptr)(float *)(src + 32u) * as_v;
-				*(__float16_ptr)(dst + 48u) += *(__float16_ptr)(float *)(src + 48u) * as_v;
+					*(__float16_ptr)(dst + 0u)  += *(__float16_ptr)(float *)(src + 0u)  * as_v;
+					*(__float16_ptr)(dst + 16u) += *(__float16_ptr)(float *)(src + 16u) * as_v;
+					*(__float16_ptr)(dst + 32u) += *(__float16_ptr)(float *)(src + 32u) * as_v;
+					*(__float16_ptr)(dst + 48u) += *(__float16_ptr)(float *)(src + 48u) * as_v;
+				}
+			} else {
+				for (r = 0u; r < m_cur; r++) {
+					const float *src = tile_acc_buf + (r << 6);
+					float *dst = out_blk + (size_t)r * out_dim + col0;
+					float16 as_v = (float16)a_scales_blk[r];
+
+					*(__float16_ptr)(dst + 0u)  = *(__float16_ptr)(float *)(src + 0u)  * as_v;
+					*(__float16_ptr)(dst + 16u) = *(__float16_ptr)(float *)(src + 16u) * as_v;
+					*(__float16_ptr)(dst + 32u) = *(__float16_ptr)(float *)(src + 32u) * as_v;
+					*(__float16_ptr)(dst + 48u) = *(__float16_ptr)(float *)(src + 48u) * as_v;
+				}
 			}
 		} else {
+			uint32_t rem = (out_dim > col0) ? (out_dim - col0) : 0u;
+			uint32_t i;
+
 			for (r = 0u; r < m_cur; r++) {
 				const float *src = tile_acc_buf + (r << 6);
 				float *dst = out_blk + (size_t)r * out_dim + col0;
-				float16 as_v = (float16)a_scales_blk[r];
+				float as = a_scales_blk[r];
 
-				*(__float16_ptr)(dst + 0u)  = *(__float16_ptr)(float *)(src + 0u)  * as_v;
-				*(__float16_ptr)(dst + 16u) = *(__float16_ptr)(float *)(src + 16u) * as_v;
-				*(__float16_ptr)(dst + 32u) = *(__float16_ptr)(float *)(src + 32u) * as_v;
-				*(__float16_ptr)(dst + 48u) = *(__float16_ptr)(float *)(src + 48u) * as_v;
+				if (add) {
+					for (i = 0u; i < rem; i++) {
+						dst[i] += src[i] * as;
+					}
+				} else {
+					for (i = 0u; i < rem; i++) {
+						dst[i] = src[i] * as;
+					}
+				}
 			}
 		}
-	} else {
-		uint32_t rem = (out_dim > col0) ? (out_dim - col0) : 0u;
+	}
+
+	if (argmax_blk && best_val_blk) {
+		uint32_t rem = (col0 + 64u <= out_dim) ? 64u : ((out_dim > col0) ? (out_dim - col0) : 0u);
 		uint32_t i;
 
 		for (r = 0u; r < m_cur; r++) {
 			const float *src = tile_acc_buf + (r << 6);
-			float *dst = out_blk + (size_t)r * out_dim + col0;
-			float as = a_scales_blk[r];
+			float16 as_v = (float16)a_scales_blk[r];
+			float16 v0 = *(__float16_ptr)(float *)(src + 0u)  * as_v;
+			float16 v1 = *(__float16_ptr)(float *)(src + 16u) * as_v;
+			float16 v2 = *(__float16_ptr)(float *)(src + 32u) * as_v;
+			float16 v3 = *(__float16_ptr)(float *)(src + 48u) * as_v;
+			float tm = hmax_f16_local(__max(__max(v0, v1), __max(v2, v3)));
 
-			if (add) {
+			if (tm > best_val_blk[r]) {
+				float as = a_scales_blk[r];
+
 				for (i = 0u; i < rem; i++) {
-					dst[i] += src[i] * as;
-				}
-			} else {
-				for (i = 0u; i < rem; i++) {
-					dst[i] = src[i] * as;
+					float v = src[i] * as;
+
+					if (v > best_val_blk[r]) {
+						best_val_blk[r] = v;
+						argmax_blk[r] = col0 + i;
+					}
 				}
 			}
 		}
@@ -912,13 +943,14 @@ static void store_tile_acc_w4(float *out_blk, const float *tile_acc_buf,
  *   - L2-SRAM-resident tile_acc buffer (passed in)
  *   - SE0-streamed w_scales during drain (bypasses L1D -> safe for DRU L2 ping-pong!)
  *   - Interleaved HWAXFER/HWARCV + FP32 FMA hiding XFER->RCV hardware latency
- *   - Out-of-line branch-hoisted store_tile_acc_w4
+ *   - Out-of-line branch-hoisted store_tile_acc_w4 (with optional fused per-row argmax)
  */
 static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, const float *a_scales_blk,
 					   const uint8_t *w_packed, const float *w_scales,
 					   float *tile_acc_buf,
 					   uint32_t m_cur, uint32_t k_pad, uint32_t n_tiles,
-					   uint32_t col_base, uint32_t out_dim, int add)
+					   uint32_t col_base, uint32_t out_dim, int add,
+					   uint32_t *argmax_blk, float *best_val_blk)
 {
 	__HWA_CONFIG_REG cfg;
 	__HWA_OFFSET_REG off;
@@ -1094,7 +1126,8 @@ static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, 
 				}
 				if (kt == 0u) {
 					store_tile_acc_w4(out_blk, tile_acc_buf, a_scales_blk, m_cur,
-							  col_base + (prev_nt << 6), out_dim, add);
+							  col_base + (prev_nt << 6), out_dim, add,
+							  argmax_blk, best_val_blk);
 				}
 			}
 		}
@@ -1166,7 +1199,8 @@ static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, 
 			}
 		}
 		store_tile_acc_w4(out_blk, tile_acc_buf, a_scales_blk, m_cur,
-				  col_base + ((n_tiles - 1u) << 6), out_dim, add);
+				  col_base + ((n_tiles - 1u) << 6), out_dim, add,
+				  argmax_blk, best_val_blk);
 	}
 
 	__SE1_CLOSE();
@@ -1276,6 +1310,19 @@ void c7x_mma_gemm_w4a8_g64_f32(float *out, const int8_t *a, const float *a_scale
 #endif
 	}
 
+	/* Optional per-row batched argmax tracking (for speculative decode, m <= 240). */
+	float best_vals_arr[240];
+	float *best_vals_ptr = NULL;
+	if (argmax_out && m <= 240u) {
+		uint32_t r;
+
+		best_vals_ptr = best_vals_arr;
+		for (r = 0u; r < m; r++) {
+			argmax_out[r] = 0u;
+			best_vals_arr[r] = -3.4e38f;
+		}
+	}
+
 	/* Place tile_acc (16 KiB) in L2 SRAM when available. */
 	if (dru_base != NULL && dru_bytes >= 16384u) {
 		tile_acc = (float *)dru_base;
@@ -1343,11 +1390,13 @@ void c7x_mma_gemm_w4a8_g64_f32(float *out, const int8_t *a, const float *a_scale
 					uint32_t m_cur = (m - m0 < block_m) ? (m - m0) : block_m;
 
 					mma_gemm_w4a8_g64_mblock_chunk(
-						out + (size_t)m0 * out_dim,
+						out ? (out + (size_t)m0 * out_dim) : NULL,
 						a + (size_t)m0 * k_pad,
 						a_scales + m0,
 						lw, ls, tile_acc, m_cur, k_pad, cur_nt,
-						nt0 << 6, out_dim, add);
+						nt0 << 6, out_dim, add,
+						best_vals_ptr ? (argmax_out + m0) : NULL,
+						best_vals_ptr ? (best_vals_ptr + m0) : NULL);
 				}
 				nt0 = next_nt0;
 				cur_nt = next_cnt;
@@ -1360,11 +1409,13 @@ void c7x_mma_gemm_w4a8_g64_f32(float *out, const int8_t *a, const float *a_scale
 	for (m0 = 0u; m0 < m; m0 += block_m) {
 		uint32_t m_cur = (m - m0 < block_m) ? (m - m0) : block_m;
 
-		mma_gemm_w4a8_g64_mblock_chunk(out + (size_t)m0 * out_dim,
+		mma_gemm_w4a8_g64_mblock_chunk(out ? (out + (size_t)m0 * out_dim) : NULL,
 					       a + (size_t)m0 * k_pad,
 					       a_scales + m0,
 					       w_packed, w_scales, tile_acc, m_cur, k_pad, n_tiles,
-					       0u, out_dim, add);
+					       0u, out_dim, add,
+					       best_vals_ptr ? (argmax_out + m0) : NULL,
+					       best_vals_ptr ? (best_vals_ptr + m0) : NULL);
 	}
 }
 

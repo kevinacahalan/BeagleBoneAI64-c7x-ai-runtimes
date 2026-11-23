@@ -171,10 +171,19 @@ static int carve_scratch(const struct c7m_header *hdr, void *buf, uint32_t bytes
 {
 	uint8_t *p = (uint8_t *)buf;
 	uint32_t off = 0u;
+	uint32_t q_dim = hdr->n_heads * hdr->head_size;
+	uint32_t q_dim_pad = align64_u32(q_dim);
+	uint32_t kv_dim_pad = align64_u32(hdr->kv_dim);
 	uint32_t dim_b = align64_u32(hdr->dim_pad * (uint32_t)sizeof(float));
+	uint32_t q_b   = align64_u32(q_dim_pad * (uint32_t)sizeof(float));
+	uint32_t kv_b  = align64_u32(kv_dim_pad * (uint32_t)sizeof(float));
+	uint32_t xb_b  = q_b > dim_b ? q_b : dim_b;
 	uint32_t hid_b = align64_u32(hdr->hidden_pad * (uint32_t)sizeof(float));
 	uint32_t att_b = align64_u32(hdr->seq_len * (uint32_t)sizeof(float));
 	uint32_t max_k = hdr->hidden_pad > hdr->dim_pad ? hdr->hidden_pad : hdr->dim_pad;
+	if (q_dim_pad > max_k) {
+		max_k = q_dim_pad;
+	}
 	uint32_t xq_b  = align64_u32(max_k);
 	/* Full W4A8 models never use y_i32 staging, freeing extra L2 SRAM for DRU ping-pong! */
 	uint32_t need_y32 = !((hdr->flags & C7M_FLAG_W4A8_LAYERS) && (hdr->flags & C7M_FLAG_W4A8_WCLS));
@@ -193,11 +202,11 @@ static int carve_scratch(const struct c7m_header *hdr, void *buf, uint32_t bytes
 	} while (0)
 
 	TAKE(a->x,     float,   dim_b);
-	TAKE(a->xb,    float,   dim_b);
+	TAKE(a->xb,    float,   xb_b);
 	TAKE(a->xb2,   float,   dim_b);
-	TAKE(a->q,     float,   dim_b);
-	TAKE(a->k,     float,   dim_b);
-	TAKE(a->v,     float,   dim_b);
+	TAKE(a->q,     float,   q_b);
+	TAKE(a->k,     float,   kv_b);
+	TAKE(a->v,     float,   kv_b);
 	TAKE(a->hb,    float,   hid_b);
 	TAKE(a->hb2,   float,   hid_b);
 	TAKE(a->att,   float,   att_b);
@@ -247,7 +256,8 @@ static inline void proj_linear(float *out, const int8_t *xq, float x_scale,
 
 int c7x_llama_forward_token(const struct c7m_header *hdr,
 			    uint32_t token, uint32_t pos,
-			    float *k_cache, float *v_cache,
+			    void *k_cache, void *v_cache,
+			    float *k_scale, float *v_scale, uint32_t req_flags,
 			    float *logits_out, uint32_t *argmax_out,
 			    void *scratch, uint32_t scratch_bytes,
 			    const void *msmc_layers, uint32_t msmc_n_layers,
@@ -258,23 +268,28 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 	struct scratch_arena s;
 	const struct c7m_layer_offs *layers;
 	const struct c7m_layer_bias_offs *biases = NULL;
+	const struct c7m_layer_qknorm_offs *qknorms = NULL;
 	const uint8_t *msmc_base = (const uint8_t *)msmc_layers;
 	const float *rope_cos;
 	const float *rope_sin;
 	const float *rms_final;
 	const void *wcls_q;
 	const float *wcls_s;
-	uint32_t dim, dim_pad, hidden_dim, hidden_pad, kv_dim, kv_dim_pad;
+	uint32_t dim, dim_pad, q_dim, q_dim_pad, hidden_dim, hidden_pad, kv_dim, kv_dim_pad;
 	uint32_t n_layers_run, l, argmax = 0u;
 	uint64_t t_start, t0, t1, t_layer0;
 	float x_scale = 0.0f;
 	float eps;
-	int tiled, w4_layers, w4_wcls, neox;
+	int tiled, w4_layers, w4_wcls, neox, kv_int8;
 
 	if (c7x_llama_validate(hdr) != 0) {
 		return -1;
 	}
+	kv_int8 = (req_flags & C7X_LLAMA_REQ_KV_INT8) ? 1 : 0;
 	if (token >= hdr->vocab_size || pos >= hdr->seq_len || !k_cache || !v_cache || !scratch) {
+		return -2;
+	}
+	if (kv_int8 && (!k_scale || !v_scale)) {
 		return -2;
 	}
 	if (stop_after_layer == 0u && !logits_out && !argmax_out) {
@@ -299,6 +314,8 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 
 	dim        = hdr->dim;
 	dim_pad    = hdr->dim_pad;
+	q_dim      = hdr->n_heads * hdr->head_size;
+	q_dim_pad  = align64_u32(q_dim);
 	hidden_dim = hdr->hidden_dim;
 	hidden_pad = hdr->hidden_pad;
 	kv_dim     = hdr->kv_dim;
@@ -315,6 +332,9 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 	layers    = (const struct c7m_layer_offs *)model_ptr(hdr, hdr->off_layer_table);
 	if ((hdr->flags & C7M_FLAG_HAS_QKV_BIAS) && hdr->off_bias_table != 0u) {
 		biases = (const struct c7m_layer_bias_offs *)model_ptr(hdr, hdr->off_bias_table);
+	}
+	if ((hdr->flags & C7M_FLAG_HAS_QK_NORM) && hdr->off_qknorm_table != 0u) {
+		qknorms = (const struct c7m_layer_qknorm_offs *)model_ptr(hdr, hdr->off_qknorm_table);
 	}
 	rope_cos  = (const float *)model_ptr(hdr, hdr->off_rope_cos) + pos * (hdr->head_size >> 1);
 	rope_sin  = (const float *)model_ptr(hdr, hdr->off_rope_sin) + pos * (hdr->head_size >> 1);
@@ -335,8 +355,6 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 		const struct c7m_layer_offs *lo = &layers[l];
 		const float *rms_att = (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->rms_att);
 		const float *rms_ffn = (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->rms_ffn);
-		float *k_layer = k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
-		float *v_layer = v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
 
 		t_layer0 = read_tsc();
 
@@ -359,7 +377,7 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 		proj_linear(s.q, s.xq, x_scale,
 			    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wq_q),
 			    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wq_s),
-			    s.y_i32, dim_pad, dim_pad, dim, 0, w4_layers, tiled,
+			    s.y_i32, dim_pad, q_dim_pad, q_dim, 0, w4_layers, tiled,
 			    prof ? &prof->cyc_qkv_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 		proj_linear(s.k, s.xq, x_scale,
@@ -379,7 +397,7 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 			const struct c7m_layer_bias_offs *bo = &biases[l];
 
 			if (bo->bq) {
-				c7x_add_bias_f32(s.q, (const float *)model_ptr(hdr, bo->bq), dim);
+				c7x_add_bias_f32(s.q, (const float *)model_ptr(hdr, bo->bq), q_dim);
 			}
 			if (bo->bk) {
 				c7x_add_bias_f32(s.k, (const float *)model_ptr(hdr, bo->bk), kv_dim);
@@ -389,29 +407,77 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 			}
 		}
 
-		/* 2c. RoPE + store K, V into KV cache */
+		/* Optional per-head QK-RMSNorm before RoPE (Qwen3) */
+		if (qknorms) {
+			const struct c7m_layer_qknorm_offs *qo = &qknorms[l];
+
+			t0 = read_tsc();
+			if (qo->q_norm) {
+				c7x_rmsnorm_heads_f32(s.q, (const float *)model_ptr(hdr, qo->q_norm),
+						      hdr->n_heads, hdr->head_size, eps);
+			}
+			if (qo->k_norm) {
+				c7x_rmsnorm_heads_f32(s.k, (const float *)model_ptr(hdr, qo->k_norm),
+						      hdr->n_kv_heads, hdr->head_size, eps);
+			}
+			if (prof) {
+				prof->cyc_rmsnorm += (read_tsc() - t0);
+			}
+		}
+
+		/* 2c. RoPE + store K, V into KV cache (FP32 or per-head INT8) */
 		t0 = read_tsc();
 		c7x_rope_f32(s.q, s.k, rope_cos, rope_sin,
 			     hdr->n_heads, hdr->n_kv_heads, hdr->head_size, neox);
-		memcpy(k_layer + (uint64_t)pos * kv_dim, s.k, kv_dim * sizeof(float));
-		memcpy(v_layer + (uint64_t)pos * kv_dim, s.v, kv_dim * sizeof(float));
-		t1 = read_tsc();
-		if (prof) {
-			prof->cyc_rope += (t1 - t0);
+		if (kv_int8) {
+			int8_t *kq_layer = (int8_t *)k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+			int8_t *vq_layer = (int8_t *)v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+			float  *ks_layer = k_scale + (uint64_t)l * hdr->seq_len * hdr->n_kv_heads;
+			float  *vs_layer = v_scale + (uint64_t)l * hdr->seq_len * hdr->n_kv_heads;
+
+			c7x_kv_quant_store_i8(kq_layer + (uint64_t)pos * kv_dim,
+					      ks_layer + (uint64_t)pos * hdr->n_kv_heads,
+					      s.k, hdr->n_kv_heads, hdr->head_size);
+			c7x_kv_quant_store_i8(vq_layer + (uint64_t)pos * kv_dim,
+					      vs_layer + (uint64_t)pos * hdr->n_kv_heads,
+					      s.v, hdr->n_kv_heads, hdr->head_size);
+			t1 = read_tsc();
+			if (prof) {
+				prof->cyc_rope += (t1 - t0);
+			}
+
+			/* 2d. Multi-head causal attention (INT8 KV) -> s.xb[q_dim] */
+			t0 = read_tsc();
+			c7x_attn_mha_i8_f32(s.xb, s.q, kq_layer, ks_layer, vq_layer, vs_layer,
+					    s.att, pos, hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
+			t1 = read_tsc();
+			if (prof) {
+				prof->cyc_attn += (t1 - t0);
+			}
+		} else {
+			float *k_layer = (float *)k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+			float *v_layer = (float *)v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+
+			memcpy(k_layer + (uint64_t)pos * kv_dim, s.k, kv_dim * sizeof(float));
+			memcpy(v_layer + (uint64_t)pos * kv_dim, s.v, kv_dim * sizeof(float));
+			t1 = read_tsc();
+			if (prof) {
+				prof->cyc_rope += (t1 - t0);
+			}
+
+			/* 2d. Multi-head causal attention (FP32 KV) -> s.xb[q_dim] */
+			t0 = read_tsc();
+			c7x_attn_mha_f32(s.xb, s.q, k_layer, v_layer, s.att, pos,
+					 hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
+			t1 = read_tsc();
+			if (prof) {
+				prof->cyc_attn += (t1 - t0);
+			}
 		}
 
-		/* 2d. Multi-head causal attention -> s.xb */
+		/* 2e. Output projection Wo (q_dim -> dim) + residual add into s.x */
 		t0 = read_tsc();
-		c7x_attn_mha_f32(s.xb, s.q, k_layer, v_layer, s.att, pos,
-				 hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
-		t1 = read_tsc();
-		if (prof) {
-			prof->cyc_attn += (t1 - t0);
-		}
-
-		/* 2e. Output projection Wo + residual add into s.x */
-		t0 = read_tsc();
-		c7x_quantize_f32_i8(s.xq, s.xb, dim, dim_pad, &x_scale);
+		c7x_quantize_f32_i8(s.xq, s.xb, q_dim, q_dim_pad, &x_scale);
 		t1 = read_tsc();
 		if (prof) {
 			prof->cyc_quant += (t1 - t0);
@@ -420,7 +486,7 @@ int c7x_llama_forward_token(const struct c7m_header *hdr,
 		proj_linear(s.x, s.xq, x_scale,
 			    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wo_q),
 			    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wo_s),
-			    s.y_i32, dim_pad, dim_pad, dim, 1, w4_layers, tiled,
+			    s.y_i32, q_dim_pad, dim_pad, dim, 1, w4_layers, tiled,
 			    prof ? &prof->cyc_wo_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 		/* 2f. FFN RMSNorm */
@@ -595,7 +661,8 @@ static void proj_linear_batched(float *out, const int8_t *xq, const float *x_sca
 
 int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			     const uint32_t *tokens, uint32_t n_tokens, uint32_t start_pos,
-			     float *k_cache, float *v_cache,
+			     void *k_cache, void *v_cache,
+			     float *k_scale, float *v_scale, uint32_t req_flags,
 			     float *logits_out, uint32_t *argmax_out,
 			     void *l2_scratch, uint32_t l2_bytes,
 			     void *prefill_buf, uint32_t prefill_bytes,
@@ -604,23 +671,31 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 {
 	const struct c7m_layer_offs *layers;
 	const struct c7m_layer_bias_offs *biases = NULL;
+	const struct c7m_layer_qknorm_offs *qknorms = NULL;
 	const uint8_t *msmc_base = (const uint8_t *)msmc_layers;
-	uint32_t dim, dim_pad, hidden_dim, hidden_pad, kv_dim, kv_dim_pad, max_k, max_n;
+	uint32_t dim, dim_pad, q_dim, q_dim_pad, hidden_dim, hidden_pad, kv_dim, kv_dim_pad, max_k, max_n;
 	uint32_t max_chunk, done = 0u, argmax = 0u;
 	uint64_t t_start, t0, t1, t_layer0;
 	float eps;
-	int tiled, w4_layers, w4_wcls, neox;
+	int tiled, w4_layers, w4_wcls, neox, kv_int8, all_logits, all_argmax;
 	struct scratch_arena l2s;
 
 	if (c7x_llama_validate(hdr) != 0) {
 		return -1;
 	}
+	kv_int8    = (req_flags & C7X_LLAMA_REQ_KV_INT8) ? 1 : 0;
+	all_logits = (req_flags & C7X_LLAMA_REQ_ALL_LOGITS) ? 1 : 0;
+	all_argmax = (req_flags & C7X_LLAMA_REQ_ALL_ARGMAX) ? 1 : 0;
 	if (!tokens || n_tokens == 0u || start_pos + n_tokens > hdr->seq_len ||
 	    !k_cache || !v_cache || !l2_scratch || !prefill_buf) {
 		return -2;
 	}
+	if (kv_int8 && (!k_scale || !v_scale)) {
+		return -2;
+	}
 	if (n_tokens == 1u) {
 		return c7x_llama_forward_token(hdr, tokens[0], start_pos, k_cache, v_cache,
+					       k_scale, v_scale, req_flags,
 					       logits_out, argmax_out, l2_scratch, l2_bytes,
 					       msmc_layers, msmc_n_layers, prof, NULL, -1, 0u);
 	}
@@ -643,12 +718,17 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 
 	dim        = hdr->dim;
 	dim_pad    = hdr->dim_pad;
+	q_dim      = hdr->n_heads * hdr->head_size;
+	q_dim_pad  = align64_u32(q_dim);
 	hidden_dim = hdr->hidden_dim;
 	hidden_pad = hdr->hidden_pad;
 	kv_dim     = hdr->kv_dim;
 	kv_dim_pad = align64_u32(kv_dim);
 	max_k      = hidden_pad > dim_pad ? hidden_pad : dim_pad;
-	max_n      = hidden_pad > dim_pad ? hidden_pad : dim_pad;
+	if (q_dim_pad > max_k) {
+		max_k = q_dim_pad;
+	}
+	max_n      = max_k;
 	tiled      = (hdr->flags & C7M_FLAG_TILED_WEIGHTS) ? 1 : 0;
 	w4_layers  = (hdr->flags & C7M_FLAG_W4A8_LAYERS) ? 1 : 0;
 	w4_wcls    = (hdr->flags & C7M_FLAG_W4A8_WCLS) ? 1 : 0;
@@ -658,6 +738,9 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 	layers = (const struct c7m_layer_offs *)model_ptr(hdr, hdr->off_layer_table);
 	if ((hdr->flags & C7M_FLAG_HAS_QKV_BIAS) && hdr->off_bias_table != 0u) {
 		biases = (const struct c7m_layer_bias_offs *)model_ptr(hdr, hdr->off_bias_table);
+	}
+	if ((hdr->flags & C7M_FLAG_HAS_QK_NORM) && hdr->off_qknorm_table != 0u) {
+		qknorms = (const struct c7m_layer_qknorm_offs *)model_ptr(hdr, hdr->off_qknorm_table);
 	}
 
 	/*
@@ -674,7 +757,8 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 #endif
 	{
 		size_t per_tok =
-			(size_t)dim * 2u * sizeof(float) +          /* X, Q */
+			(size_t)dim * sizeof(float) +               /* X */
+			(size_t)q_dim * sizeof(float) +             /* Q */
 			(size_t)kv_dim * 2u * sizeof(float) +       /* K, V */
 			(size_t)hidden_dim * 2u * sizeof(float) +   /* HB, HB2 */
 			(size_t)max_k * sizeof(int8_t) +            /* XQ */
@@ -712,7 +796,7 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 		} while (0)
 
 		PTAKE(X,   float,  (size_t)m * dim * sizeof(float));
-		PTAKE(Q,   float,  (size_t)m * dim * sizeof(float));
+		PTAKE(Q,   float,  (size_t)m * q_dim * sizeof(float));
 		PTAKE(K,   float,  (size_t)m * kv_dim * sizeof(float));
 		PTAKE(V,   float,  (size_t)m * kv_dim * sizeof(float));
 		PTAKE(HB,  float,  (size_t)m * hidden_dim * sizeof(float));
@@ -741,8 +825,6 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			const struct c7m_layer_offs *lo = &layers[l];
 			const float *rms_att = (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->rms_att);
 			const float *rms_ffn = (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->rms_ffn);
-			float *k_layer = k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
-			float *v_layer = v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
 
 			t_layer0 = read_tsc();
 
@@ -760,7 +842,7 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			proj_linear_batched(Q, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wq_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wq_s),
-					    Y32, m, dim_pad, dim_pad, dim, mma_block_m, 0, w4_layers, tiled,
+					    Y32, m, dim_pad, q_dim_pad, q_dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_qkv_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			proj_linear_batched(K, XQ, XS,
@@ -775,11 +857,11 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 					    Y32, m, dim_pad, kv_dim_pad, kv_dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_qkv_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
-			/* Optional QKV biases + RoPE + KV cache populate */
+			/* Optional QKV biases + QK-RMSNorm + RoPE + KV cache populate */
 			t0 = read_tsc();
 			for (t = 0u; t < m; t++) {
 				uint32_t p = cur_pos + t;
-				float *qt = Q + (size_t)t * dim;
+				float *qt = Q + (size_t)t * q_dim;
 				float *kt = K + (size_t)t * kv_dim;
 				float *vt = V + (size_t)t * kv_dim;
 				const float *rc = (const float *)model_ptr(hdr, hdr->off_rope_cos) +
@@ -789,25 +871,72 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 
 				if (biases) {
 					const struct c7m_layer_bias_offs *bo = &biases[l];
-					if (bo->bq) c7x_add_bias_f32(qt, (const float *)model_ptr(hdr, bo->bq), dim);
+					if (bo->bq) c7x_add_bias_f32(qt, (const float *)model_ptr(hdr, bo->bq), q_dim);
 					if (bo->bk) c7x_add_bias_f32(kt, (const float *)model_ptr(hdr, bo->bk), kv_dim);
 					if (bo->bv) c7x_add_bias_f32(vt, (const float *)model_ptr(hdr, bo->bv), kv_dim);
 				}
+				if (qknorms) {
+					const struct c7m_layer_qknorm_offs *qo = &qknorms[l];
+					if (qo->q_norm) {
+						c7x_rmsnorm_heads_f32(qt, (const float *)model_ptr(hdr, qo->q_norm),
+								      hdr->n_heads, hdr->head_size, eps);
+					}
+					if (qo->k_norm) {
+						c7x_rmsnorm_heads_f32(kt, (const float *)model_ptr(hdr, qo->k_norm),
+								      hdr->n_kv_heads, hdr->head_size, eps);
+					}
+				}
 				c7x_rope_f32(qt, kt, rc, rs, hdr->n_heads, hdr->n_kv_heads, hdr->head_size, neox);
-				memcpy(k_layer + (uint64_t)p * kv_dim, kt, kv_dim * sizeof(float));
-				memcpy(v_layer + (uint64_t)p * kv_dim, vt, kv_dim * sizeof(float));
+				if (kv_int8) {
+					int8_t *kq_layer = (int8_t *)k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+					int8_t *vq_layer = (int8_t *)v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+					float  *ks_layer = k_scale + (uint64_t)l * hdr->seq_len * hdr->n_kv_heads;
+					float  *vs_layer = v_scale + (uint64_t)l * hdr->seq_len * hdr->n_kv_heads;
+
+					c7x_kv_quant_store_i8(kq_layer + (uint64_t)p * kv_dim,
+							      ks_layer + (uint64_t)p * hdr->n_kv_heads,
+							      kt, hdr->n_kv_heads, hdr->head_size);
+					c7x_kv_quant_store_i8(vq_layer + (uint64_t)p * kv_dim,
+							      vs_layer + (uint64_t)p * hdr->n_kv_heads,
+							      vt, hdr->n_kv_heads, hdr->head_size);
+				} else {
+					float *k_layer = (float *)k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+					float *v_layer = (float *)v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+
+					memcpy(k_layer + (uint64_t)p * kv_dim, kt, kv_dim * sizeof(float));
+					memcpy(v_layer + (uint64_t)p * kv_dim, vt, kv_dim * sizeof(float));
+				}
 			}
 			t1 = read_tsc();
 			if (prof) prof->cyc_rope += (t1 - t0);
 
-			/* Causal MHA attention -> L2 l2s.xb -> fused Quant -> XQ (zero DDR XB write/read!) */
+			/* Causal MHA attention -> L2 l2s.xb[q_dim] -> fused Quant -> XQ */
 			t0 = read_tsc();
-			for (t = 0u; t < m; t++) {
-				c7x_attn_mha_f32(l2s.xb, Q + (size_t)t * dim,
-						 k_layer, v_layer, l2s.att, cur_pos + t,
-						 hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
-				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, l2s.xb,
-						    dim, dim_pad, &XS[t]);
+			if (kv_int8) {
+				const int8_t *kq_layer = (const int8_t *)k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+				const int8_t *vq_layer = (const int8_t *)v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+				const float  *ks_layer = k_scale + (uint64_t)l * hdr->seq_len * hdr->n_kv_heads;
+				const float  *vs_layer = v_scale + (uint64_t)l * hdr->seq_len * hdr->n_kv_heads;
+
+				for (t = 0u; t < m; t++) {
+					c7x_attn_mha_i8_f32(l2s.xb, Q + (size_t)t * q_dim,
+							    kq_layer, ks_layer, vq_layer, vs_layer,
+							    l2s.att, cur_pos + t,
+							    hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
+					c7x_quantize_f32_i8(XQ + (size_t)t * q_dim_pad, l2s.xb,
+							    q_dim, q_dim_pad, &XS[t]);
+				}
+			} else {
+				const float *k_layer = (const float *)k_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+				const float *v_layer = (const float *)v_cache + (uint64_t)l * hdr->seq_len * kv_dim;
+
+				for (t = 0u; t < m; t++) {
+					c7x_attn_mha_f32(l2s.xb, Q + (size_t)t * q_dim,
+							 k_layer, v_layer, l2s.att, cur_pos + t,
+							 hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
+					c7x_quantize_f32_i8(XQ + (size_t)t * q_dim_pad, l2s.xb,
+							    q_dim, q_dim_pad, &XS[t]);
+				}
 			}
 			t1 = read_tsc();
 			if (prof) prof->cyc_attn += (t1 - t0);
@@ -815,7 +944,7 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			proj_linear_batched(X, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wo_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wo_s),
-					    Y32, m, dim_pad, dim_pad, dim, mma_block_m, 1, w4_layers, tiled,
+					    Y32, m, q_dim_pad, dim_pad, dim, mma_block_m, 1, w4_layers, tiled,
 					    prof ? &prof->cyc_wo_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			/* L2-fused FFN RMSNorm -> l2s.xb -> Quant -> XQ */
@@ -865,10 +994,94 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			}
 		}
 
+		/* 3. Classifier for all tokens (ALL_ARGMAX / ALL_LOGITS) or ONLY the very last token! */
+		if (all_argmax && logits_out) {
+			const float *rms_final = (const float *)model_ptr(hdr, hdr->off_rms_final);
+			const void *wcls_q     = model_ptr(hdr, hdr->off_wcls_q);
+			const float *wcls_s    = (const float *)model_ptr(hdr, hdr->off_wcls_s);
+			uint32_t *arg_dst      = (uint32_t *)logits_out + done;
+
+			t0 = read_tsc();
+			for (t = 0u; t < m; t++) {
+				c7x_rmsnorm_f32(l2s.xb, X + (size_t)t * dim, rms_final, dim, eps);
+				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, l2s.xb,
+						    dim, dim_pad, &XS[t]);
+			}
+			if (prof) prof->cyc_rmsnorm += (read_tsc() - t0);
+
+			if (w4_wcls) {
+				t0 = read_tsc();
+				c7x_mma_gemm_w4a8_g64_f32(NULL, XQ, XS,
+							  (const uint8_t *)wcls_q, wcls_s,
+							  m, dim_pad, hdr->vocab_pad, hdr->vocab_size,
+							  mma_block_m, 0, arg_dst);
+				if (prof) prof->cyc_cls_mma += (read_tsc() - t0);
+			} else {
+				for (t = 0u; t < m; t++) {
+					t0 = read_tsc();
+					mma_linear_w8(XQ + (size_t)t * dim_pad, (const int8_t *)wcls_q,
+						      l2s.y_i32, dim_pad, hdr->vocab_pad, tiled);
+					t1 = read_tsc();
+					if (prof) prof->cyc_cls_mma += (t1 - t0);
+					arg_dst[t] = c7x_dequant_argmax_i32_f32(
+						NULL, l2s.y_i32, wcls_s, XS[t], hdr->vocab_size);
+					if (prof) prof->cyc_dequant += (read_tsc() - t1);
+				}
+			}
+			if (done + m == n_tokens) {
+				argmax = arg_dst[m - 1u];
+			}
+		} else if (all_logits && logits_out) {
+			const float *rms_final = (const float *)model_ptr(hdr, hdr->off_rms_final);
+			const void *wcls_q     = model_ptr(hdr, hdr->off_wcls_q);
+			const float *wcls_s    = (const float *)model_ptr(hdr, hdr->off_wcls_s);
+
+			t0 = read_tsc();
+			for (t = 0u; t < m; t++) {
+				c7x_rmsnorm_f32(l2s.xb, X + (size_t)t * dim, rms_final, dim, eps);
+				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, l2s.xb,
+						    dim, dim_pad, &XS[t]);
+			}
+			if (prof) prof->cyc_rmsnorm += (read_tsc() - t0);
+
+			if (w4_wcls) {
+				t0 = read_tsc();
+				c7x_mma_gemm_w4a8_g64_f32(logits_out + (size_t)done * hdr->vocab_size,
+							  XQ, XS,
+							  (const uint8_t *)wcls_q, wcls_s,
+							  m, dim_pad, hdr->vocab_pad, hdr->vocab_size,
+							  mma_block_m, 0, NULL);
+				if (prof) prof->cyc_cls_mma += (read_tsc() - t0);
+			} else {
+				for (t = 0u; t < m; t++) {
+					t0 = read_tsc();
+					mma_linear_w8(XQ + (size_t)t * dim_pad, (const int8_t *)wcls_q,
+						      l2s.y_i32, dim_pad, hdr->vocab_pad, tiled);
+					t1 = read_tsc();
+					if (prof) prof->cyc_cls_mma += (t1 - t0);
+					c7x_dequant_argmax_i32_f32(
+						logits_out + (size_t)(done + t) * hdr->vocab_size,
+						l2s.y_i32, wcls_s, XS[t], hdr->vocab_size);
+					if (prof) prof->cyc_dequant += (read_tsc() - t1);
+				}
+			}
+			if (done + m == n_tokens) {
+				const float *last_l = logits_out + (size_t)(n_tokens - 1u) * hdr->vocab_size;
+				float best_v = last_l[0];
+				uint32_t bi = 0u, vi;
+				for (vi = 1u; vi < hdr->vocab_size; vi++) {
+					if (last_l[vi] > best_v) {
+						best_v = last_l[vi];
+						bi = vi;
+					}
+				}
+				argmax = bi;
+			}
+		}
+
 		done += m;
 
-		/* 3. Classifier ONLY for the very last token of the prompt! */
-		if (done == n_tokens) {
+		if (!all_logits && !all_argmax && done == n_tokens) {
 			float last_scale = 0.0f;
 			const float *rms_final = (const float *)model_ptr(hdr, hdr->off_rms_final);
 			const void *wcls_q     = model_ptr(hdr, hdr->off_wcls_q);

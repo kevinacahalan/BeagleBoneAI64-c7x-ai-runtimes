@@ -14,8 +14,12 @@ import argparse
 import json
 import math
 import os
+import shutil
 import struct
 import sys
+import tempfile
+import urllib.error
+import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -42,10 +46,96 @@ from llama_ref import (
 C7M_FLAG_HAS_QKV_BIAS = 1 << 3
 C7M_FLAG_UNTIED_EMB = 1 << 4
 C7M_FLAG_ROPE_NEOX = 1 << 5
+C7M_FLAG_HAS_QK_NORM = 1 << 6
 
 C7T_MAGIC = 0x31543743  # "C7T1"
 C7T_FLAG_BYTE_LEVEL = 1 << 0
 C7T_FLAG_ADD_BOS = 1 << 1
+
+
+# ---------------------------------------------------------------------------
+# Zero-dependency HuggingFace Hub HTTP downloader (stdlib urllib only)
+# ---------------------------------------------------------------------------
+
+def hf_download_file(
+    repo: str,
+    filename: str,
+    dest_path: str,
+    revision: str = "main",
+    token: Optional[str] = None,
+    optional: bool = False,
+) -> bool:
+    """Download a single file from HuggingFace Hub via stdlib HTTP with resume/skip."""
+    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+        print(f"[hf-hub] cached: {dest_path} ({os.path.getsize(dest_path) / (1024*1024):.1f} MiB)")
+        return True
+
+    url = f"https://huggingface.co/{repo}/resolve/{revision}/{filename}"
+    headers = {"User-Agent": "c7x-ai-convert-hf/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    tmp_path = dest_path + ".part"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            last_pct = -10
+            print(f"[hf-hub] downloading {repo}/{filename} ({total / (1024*1024):.1f} MiB)...")
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total > 10 * 1024 * 1024:
+                        pct = int(100 * got / total)
+                        if pct >= last_pct + 20:
+                            print(f"[hf-hub]   {filename}: {pct}% ({got / (1024*1024):.1f}/{total / (1024*1024):.1f} MiB)")
+                            last_pct = pct
+        os.replace(tmp_path, dest_path)
+        return True
+    except urllib.error.HTTPError as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if optional and e.code in (404, 410):
+            return False
+        raise RuntimeError(f"HTTP {e.code} downloading {url}: {e.reason}") from e
+
+
+def hf_download_repo(
+    repo: str, cache_dir: str, revision: str = "main", token: Optional[str] = None
+) -> str:
+    """Download config.json, tokenizer.json, and safetensors weight shard(s) for a HF repo."""
+    os.makedirs(cache_dir, exist_ok=True)
+    hf_download_file(repo, "config.json", os.path.join(cache_dir, "config.json"), revision, token)
+    hf_download_file(
+        repo, "tokenizer.json", os.path.join(cache_dir, "tokenizer.json"), revision, token, optional=True
+    )
+    hf_download_file(
+        repo,
+        "tokenizer_config.json",
+        os.path.join(cache_dir, "tokenizer_config.json"),
+        revision,
+        token,
+        optional=True,
+    )
+
+    idx_path = os.path.join(cache_dir, "model.safetensors.index.json")
+    if hf_download_file(repo, "model.safetensors.index.json", idx_path, revision, token, optional=True):
+        with open(idx_path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+        shards = sorted(set(idx["weight_map"].values()))
+        for shard in shards:
+            hf_download_file(repo, shard, os.path.join(cache_dir, shard), revision, token)
+    else:
+        hf_download_file(
+            repo, "model.safetensors", os.path.join(cache_dir, "model.safetensors"), revision, token
+        )
+    return cache_dir
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +454,27 @@ def apply_rope_neox(
     return out
 
 
+def apply_rmsnorm_heads(
+    vec: np.ndarray, weight: np.ndarray, n_heads: int, head_size: int, eps: float
+) -> np.ndarray:
+    out = vec.astype(np.float32).copy()
+    for h in range(n_heads):
+        base = h * head_size
+        out[base : base + head_size] = rmsnorm(out[base : base + head_size], weight, eps=eps)
+    return out
+
+
 def convert_and_optionally_verify(args: argparse.Namespace) -> int:
-    with open(os.path.join(args.hf_dir, "config.json"), "r", encoding="utf-8") as f:
+    hf_dir = args.hf_dir
+    if args.repo:
+        slug = args.repo.replace("/", "__")
+        cache_dir = args.cache_dir or os.path.join("models", slug)
+        token = args.hf_token or os.environ.get("HF_TOKEN")
+        hf_dir = hf_download_repo(args.repo, cache_dir, revision=args.revision, token=token)
+    if not hf_dir:
+        raise ValueError("Pass either --hf-dir or --repo <org/model>")
+
+    with open(os.path.join(hf_dir, "config.json"), "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
     dim = int(cfg["hidden_size"])
@@ -374,6 +483,7 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
     n_heads = int(cfg["num_attention_heads"])
     n_kv_heads = int(cfg.get("num_key_value_heads", n_heads))
     head_size = int(cfg.get("head_dim", dim // n_heads))
+    q_dim = n_heads * head_size
     kv_dim = n_kv_heads * head_size
     vocab_size = int(cfg["vocab_size"])
     seq_len = min(int(cfg.get("max_position_embeddings", 2048)), args.seq_len)
@@ -391,23 +501,24 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
     vocab_pad = align64(vocab_size)
     kv_dim_pad = align64(kv_dim)
 
-    reader = SafetensorsReader(args.hf_dir)
+    reader = SafetensorsReader(hf_dir)
     has_qkv_bias = reader.has("model.layers.0.self_attn.q_proj.bias")
+    has_qk_norm = reader.has("model.layers.0.self_attn.q_norm.weight")
     tied = bool(cfg.get("tie_word_embeddings", True)) or (not reader.has("lm_head.weight"))
 
     w4_layers = args.quant == "w4a8"
     w4_wcls = args.quant in ("w4a8", "hybrid")
 
     print(
-        f"[convert_hf] {cfg.get('model_type')} | dim={dim} (pad {dim_pad}), "
+        f"[convert_hf] {cfg.get('model_type')} | dim={dim} (pad {dim_pad}), q_dim={q_dim}, "
         f"hidden={hidden_dim} (pad {hidden_pad}), layers={n_layers}, "
         f"heads={n_heads}/{n_kv_heads} (hd={head_size}), vocab={vocab_size}, "
         f"seq={seq_len}, eps={rms_eps}, theta={rope_theta}, "
-        f"qkv_bias={has_qkv_bias}, tied={tied}, quant={args.quant}"
+        f"qkv_bias={has_qkv_bias}, qk_norm={has_qk_norm}, tied={tied}, quant={args.quant}"
     )
 
     # Build embedded C7T1 tokenizer if tokenizer.json is present
-    tok_json = os.path.join(args.hf_dir, "tokenizer.json")
+    tok_json = os.path.join(hf_dir, "tokenizer.json")
     tok_blob = b""
     py_tok = None
     if os.path.exists(tok_json):
@@ -493,6 +604,14 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
         off_bias_table = len(buf)
         buf.extend(b"\x00" * (n_layers * 16))
 
+    off_qknorm_table = 0
+    if has_qk_norm:
+        rem = len(buf) % 64
+        if rem:
+            buf.extend(b"\x00" * (64 - rem))
+        off_qknorm_table = len(buf)
+        buf.extend(b"\x00" * (n_layers * 8))
+
     rem = len(buf) % 64
     if rem:
         buf.extend(b"\x00" * (64 - rem))
@@ -502,7 +621,8 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
     # Keep dequantized reference layers only if verifying
     ref_layers: List[dict] = []
     layer_table_entries: List[List[int]] = []
-    bias_table_entries: List[List[int]] = []
+    bias_table_entries: List[List[np.ndarray]] = []
+    qknorm_table_entries: List[List[np.ndarray]] = []
 
     proj_map = [
         ("wq", "self_attn.q_proj.weight"),
@@ -560,19 +680,32 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
                 rld["bq"], rld["bk"], rld["bv"] = bq, bk, bv
             bias_table_entries.append([bq, bk, bv])  # append after contiguous layer blob!
 
+        if has_qk_norm:
+            qn = reader.get_f32(pfx + "self_attn.q_norm.weight")
+            kn = reader.get_f32(pfx + "self_attn.k_norm.weight")
+            if args.verify_prompt is not None:
+                rld["q_norm"], rld["k_norm"] = qn, kn
+            qknorm_table_entries.append([qn, kn])  # append after contiguous layer blob!
+
         if args.verify_prompt is not None:
             ref_layers.append(rld)
 
         if (l + 1) % 6 == 0 or l == n_layers - 1:
             print(f"[convert_hf] packed layer {l + 1}/{n_layers} ({len(buf) / (1024*1024):.1f} MiB)")
 
-    # Append biases after the contiguous layer blob so layer_stride stays uniform for MSMC staging!
+    # Append biases and QK-norms after contiguous layer blob so layer_stride stays uniform!
     if has_qkv_bias:
         for l, (bq, bk, bv) in enumerate(bias_table_entries):
             obq = append_aligned(bq)
             obk = append_aligned(bk)
             obv = append_aligned(bv)
             struct.pack_into("<4I", buf, off_bias_table + l * 16, obq, obk, obv, 0)
+
+    if has_qk_norm:
+        for l, (qn, kn) in enumerate(qknorm_table_entries):
+            oqn = append_aligned(qn)
+            okn = append_aligned(kn)
+            struct.pack_into("<2I", buf, off_qknorm_table + l * 8, oqn, okn)
 
     rem = len(buf) % 64
     if rem:
@@ -593,9 +726,11 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
         flags |= C7M_FLAG_HAS_QKV_BIAS
     if not tied:
         flags |= C7M_FLAG_UNTIED_EMB
+    if has_qk_norm:
+        flags |= C7M_FLAG_HAS_QK_NORM
 
     hdr = struct.pack(
-        "<24If8I",
+        "<24If9I",
         C7M_MAGIC,
         C7M_VERSION,
         total_size,
@@ -629,6 +764,7 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
         len(tok_blob),
         bos_id,
         eos_id,
+        off_qknorm_table,
     )
     buf[0 : len(hdr)] = hdr
 
@@ -657,19 +793,22 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
                 rld = ref_layers[l]
                 xb = rmsnorm(x, rld["rms_att"], eps=rms_eps)
                 xq, xs = quantize_act_i8_pad64(xb)
-                q = ((rld["wq_deq"][:dim] @ xq.astype(np.float32)) * xs).astype(np.float32)
+                q = ((rld["wq_deq"][:q_dim] @ xq.astype(np.float32)) * xs).astype(np.float32)
                 k = ((rld["wk_deq"][:kv_dim] @ xq.astype(np.float32)) * xs).astype(np.float32)
                 v = ((rld["wv_deq"][:kv_dim] @ xq.astype(np.float32)) * xs).astype(np.float32)
                 if has_qkv_bias:
                     q = (q + rld["bq"]).astype(np.float32)
                     k = (k + rld["bk"]).astype(np.float32)
                     v = (v + rld["bv"]).astype(np.float32)
+                if has_qk_norm:
+                    q = apply_rmsnorm_heads(q, rld["q_norm"], n_heads, head_size, rms_eps)
+                    k = apply_rmsnorm_heads(k, rld["k_norm"], n_kv_heads, head_size, rms_eps)
                 q = apply_rope_neox(q, cr, sr, n_heads, head_size)
                 k = apply_rope_neox(k, cr, sr, n_kv_heads, head_size)
                 kc[l, pos] = k
                 vc[l, pos] = v
 
-                xb_att = np.zeros((dim,), dtype=np.float32)
+                xb_att = np.zeros((q_dim,), dtype=np.float32)
                 for h in range(n_heads):
                     qh = q[h * head_size : (h + 1) * head_size]
                     kvh = h // kv_mul
@@ -741,16 +880,126 @@ def convert_and_optionally_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_self_test() -> int:
+    """Synthetic end-to-end Qwen3-like (QK-norm + q_dim != dim) safetensors -> .c7m self-test."""
+    rng = np.random.default_rng(42)
+    tmp = tempfile.mkdtemp(prefix="c7m_selftest_")
+    try:
+        dim, n_heads, n_kv, hd, hidden, vocab, n_layers = 64, 2, 1, 64, 128, 320, 2
+        q_dim, kv_dim = n_heads * hd, n_kv * hd  # q_dim=128 != dim=64!
+        cfg = {
+            "model_type": "qwen3",
+            "hidden_size": dim,
+            "intermediate_size": hidden,
+            "num_hidden_layers": n_layers,
+            "num_attention_heads": n_heads,
+            "num_key_value_heads": n_kv,
+            "head_dim": hd,
+            "vocab_size": vocab,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": True,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+        }
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+
+        # Minimal byte-level BPE tokenizer.json
+        b2u = gpt2_bytes_to_unicode()
+        vocab_dict = {b2u[b]: b for b in range(256)}
+        vocab_dict["<|im_start|>"] = 256
+        vocab_dict["<|im_end|>"] = 257
+        tok_json = {
+            "model": {"vocab": vocab_dict, "merges": []},
+            "added_tokens": [
+                {"id": 256, "content": "<|im_start|>"},
+                {"id": 257, "content": "<|im_end|>"},
+            ],
+            "decoder": {"type": "ByteLevel"},
+            "pre_tokenizer": {"type": "ByteLevel"},
+        }
+        with open(os.path.join(tmp, "tokenizer.json"), "w", encoding="utf-8") as f:
+            json.dump(tok_json, f)
+
+        # Write synthetic BF16 safetensors
+        tensors = {
+            "model.embed_tokens.weight": rng.normal(0, 0.05, (vocab, dim)).astype(np.float32),
+            "model.norm.weight": np.ones((dim,), dtype=np.float32),
+        }
+        for l in range(n_layers):
+            p = f"model.layers.{l}."
+            tensors[p + "input_layernorm.weight"] = np.ones((dim,), dtype=np.float32)
+            tensors[p + "post_attention_layernorm.weight"] = np.ones((dim,), dtype=np.float32)
+            tensors[p + "self_attn.q_norm.weight"] = rng.uniform(0.8, 1.2, (hd,)).astype(np.float32)
+            tensors[p + "self_attn.k_norm.weight"] = rng.uniform(0.8, 1.2, (hd,)).astype(np.float32)
+            tensors[p + "self_attn.q_proj.weight"] = rng.normal(0, 0.05, (q_dim, dim)).astype(np.float32)
+            tensors[p + "self_attn.k_proj.weight"] = rng.normal(0, 0.05, (kv_dim, dim)).astype(np.float32)
+            tensors[p + "self_attn.v_proj.weight"] = rng.normal(0, 0.05, (kv_dim, dim)).astype(np.float32)
+            tensors[p + "self_attn.o_proj.weight"] = rng.normal(0, 0.05, (dim, q_dim)).astype(np.float32)
+            tensors[p + "mlp.gate_proj.weight"] = rng.normal(0, 0.05, (hidden, dim)).astype(np.float32)
+            tensors[p + "mlp.up_proj.weight"] = rng.normal(0, 0.05, (hidden, dim)).astype(np.float32)
+            tensors[p + "mlp.down_proj.weight"] = rng.normal(0, 0.05, (dim, hidden)).astype(np.float32)
+
+        hdr = {}
+        raw_blob = bytearray()
+        for name, arr in tensors.items():
+            # Pack as BF16 to exercise BF16 decoding too
+            bf16 = (arr.view(np.uint32) >> np.uint32(16)).astype(np.uint16).tobytes()
+            start = len(raw_blob)
+            raw_blob.extend(bf16)
+            hdr[name] = {"dtype": "BF16", "shape": list(arr.shape), "data_offsets": [start, len(raw_blob)]}
+        hdr_bytes = json.dumps(hdr).encode("utf-8")
+        with open(os.path.join(tmp, "model.safetensors"), "wb") as f:
+            f.write(struct.pack("<Q", len(hdr_bytes)))
+            f.write(hdr_bytes)
+            f.write(raw_blob)
+
+        out_c7m = os.path.join(tmp, "qwen3_synth.c7m")
+        out_gld = os.path.join(tmp, "qwen3_synth_golden.bin")
+        ns = argparse.Namespace(
+            hf_dir=tmp,
+            repo=None,
+            cache_dir=None,
+            revision="main",
+            hf_token=None,
+            out=out_c7m,
+            quant="w4a8",
+            seq_len=64,
+            verify_prompt="<|im_start|>hi<|im_end|>",
+            steps=4,
+            dump_golden_bin=out_gld,
+        )
+        rc = convert_and_optionally_verify(ns)
+        assert rc == 0 and os.path.exists(out_c7m) and os.path.exists(out_gld)
+        print("[convert_hf] self-test PASS (synthetic Qwen3 QK-norm + q_dim!=dim + BF16 + C7T1)")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Convert any HF Llama/SmolLM/Qwen2/Mistral safetensors model to .c7m")
-    ap.add_argument("--hf-dir", required=True, help="Directory with config.json, model.safetensors, tokenizer.json")
-    ap.add_argument("--out", required=True, help="Output .c7m model path")
+    ap = argparse.ArgumentParser(
+        description="Convert any HF Llama/SmolLM/Qwen2/Qwen3/Mistral safetensors model to .c7m"
+    )
+    ap.add_argument("--hf-dir", default=None, help="Local directory with config.json, safetensors, tokenizer.json")
+    ap.add_argument("--repo", default=None, help="HuggingFace Hub repo ID (e.g. Qwen/Qwen3-0.6B) to auto-download")
+    ap.add_argument("--cache-dir", default=None, help="Download cache dir for --repo (default: models/<repo>)")
+    ap.add_argument("--revision", default="main", help="HuggingFace Hub revision/branch (default: main)")
+    ap.add_argument("--hf-token", default=None, help="Optional HuggingFace token (or set HF_TOKEN)")
+    ap.add_argument("--out", default=None, help="Output .c7m model path")
     ap.add_argument("--quant", choices=["w4a8", "hybrid", "w8a8"], default="w4a8")
     ap.add_argument("--seq-len", type=int, default=1024, help="Max sequence length for RoPE table & KV cache")
     ap.add_argument("--verify-prompt", default=None, help="Optional prompt to run NumPy reference & dump golden")
     ap.add_argument("--steps", type=int, default=16, help="Reference greedy steps after prompt")
     ap.add_argument("--dump-golden-bin", default=None, help="Output golden.bin path (requires --verify-prompt)")
+    ap.add_argument("--self-test", action="store_true", help="Run built-in synthetic converter self-test")
     args = ap.parse_args()
+    if args.self_test:
+        return run_self_test()
+    if not args.out or (not args.hf_dir and not args.repo):
+        ap.error("--out and either --hf-dir or --repo are required (or pass --self-test)")
     return convert_and_optionally_verify(args)
 
 

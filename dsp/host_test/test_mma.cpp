@@ -331,6 +331,67 @@ static int test_vec_kernels(void)
 		free(q64); free(k64); free(q64_ref); free(cos64); free(sin64);
 		free(kc64); free(vc64); free(ao64); free(ab64);
 	}
+
+	/* Test QK-RMSNorm (hd=128) & per-head INT8 KV cache attention (hd=64 and hd=128). */
+	{
+		const uint32_t hds[2] = { 64u, 128u };
+		for (int tc = 0; tc < 2; tc++) {
+			uint32_t hd = hds[tc], nh = 4u, nkv = 2u, qd = nh * hd, kvd = nkv * hd, p = 9u;
+			float *qv = (float *)alloc_aligned64(qd * sizeof(float));
+			float *qw = (float *)alloc_aligned64(hd * sizeof(float));
+			float *q_ref = (float *)alloc_aligned64(qd * sizeof(float));
+			float *kf = (float *)alloc_aligned64((p + 1u) * kvd * sizeof(float));
+			float *vf = (float *)alloc_aligned64((p + 1u) * kvd * sizeof(float));
+			int8_t *kq = (int8_t *)alloc_aligned64((p + 1u) * kvd);
+			int8_t *vq = (int8_t *)alloc_aligned64((p + 1u) * kvd);
+			float *ks = (float *)alloc_aligned64((p + 1u) * nkv * sizeof(float));
+			float *vs = (float *)alloc_aligned64((p + 1u) * nkv * sizeof(float));
+			float *out_i8 = (float *)alloc_aligned64(qd * sizeof(float));
+			float *out_f32 = (float *)alloc_aligned64(qd * sizeof(float));
+			float *ab = (float *)alloc_aligned64((p + 1u) * sizeof(float));
+
+			for (uint32_t i = 0; i < qd; i++) qv[i] = q_ref[i] = (float)rand_i8() * 0.02f;
+			for (uint32_t i = 0; i < hd; i++) qw[i] = 0.7f + (float)(i % 17u) * 0.03f;
+			c7x_rmsnorm_heads_f32(qv, qw, nh, hd, 1e-6f);
+			float qkn_err = 0.0f;
+			for (uint32_t h = 0; h < nh; h++) {
+				float ss = 0.0f;
+				for (uint32_t i = 0; i < hd; i++) ss += q_ref[h * hd + i] * q_ref[h * hd + i];
+				float inv = 1.0f / sqrtf(ss / (float)hd + 1e-6f);
+				for (uint32_t i = 0; i < hd; i++) {
+					float e = fabsf(qv[h * hd + i] - q_ref[h * hd + i] * inv * qw[i]);
+					if (e > qkn_err) qkn_err = e;
+				}
+			}
+
+			for (uint32_t t = 0; t <= p; t++) {
+				for (uint32_t i = 0; i < kvd; i++) {
+					kf[t * kvd + i] = (float)rand_i8() * 0.02f;
+					vf[t * kvd + i] = (float)rand_i8() * 0.02f;
+				}
+				c7x_kv_quant_store_i8(kq + t * kvd, ks + t * nkv, kf + t * kvd, nkv, hd);
+				c7x_kv_quant_store_i8(vq + t * kvd, vs + t * nkv, vf + t * kvd, nkv, hd);
+			}
+			c7x_attn_mha_f32(out_f32, qv, kf, vf, ab, p, nh, nkv, hd);
+			c7x_attn_mha_i8_f32(out_i8, qv, kq, ks, vq, vs, ab, p, nh, nkv, hd);
+			double dot = 0.0, na = 0.0, nb = 0.0;
+			float max_e = 0.0f;
+			for (uint32_t i = 0; i < qd; i++) {
+				float e = fabsf(out_i8[i] - out_f32[i]);
+				if (e > max_e) max_e = e;
+				dot += (double)out_i8[i] * (double)out_f32[i];
+				na += (double)out_i8[i] * (double)out_i8[i];
+				nb += (double)out_f32[i] * (double)out_f32[i];
+			}
+			double cos_kv = dot / (sqrt(na) * sqrt(nb) + 1e-12);
+			int b = (qkn_err > 1e-5f || cos_kv < 0.999);
+			printf("[host-emu] vec qknorm+kv_i8 hd=%u: %s (qkn_err=%.2g, kv_i8_cos=%.6f, max_err=%.3g)\n",
+			       hd, b ? "FAIL" : "PASS", qkn_err, cos_kv, max_e);
+			bad |= b;
+			free(qv); free(qw); free(q_ref); free(kf); free(vf);
+			free(kq); free(vq); free(ks); free(vs); free(out_i8); free(out_f32); free(ab);
+		}
+	}
 	return bad;
 }
 
@@ -388,7 +449,23 @@ int main(void)
 				float e = fabsf(got[i] - want[i]);
 				if (e > max_e) max_e = e;
 			}
-			int bad = (max_e > 1e-4f || (m == 1u && arg_got != arg_want));
+			int arg_bad = (m == 1u && arg_got != arg_want);
+			if (m > 1u && add == 0) {
+				uint32_t batch_arg[64] = { 0 };
+				c7x_mma_gemm_w4a8_g64_f32(NULL, a, as, wp, ws, m, k, n, out_dim, 16u, 0, batch_arg);
+				for (uint32_t r = 0; r < m; r++) {
+					uint32_t wi = 0u;
+					float wv = want[r * out_dim];
+					for (uint32_t c = 1u; c < out_dim; c++) {
+						if (want[r * out_dim + c] > wv) {
+							wv = want[r * out_dim + c];
+							wi = c;
+						}
+					}
+					if (batch_arg[r] != wi) arg_bad = 1;
+				}
+			}
+			int bad = (max_e > 1e-4f || arg_bad);
 			printf("[host-emu] mma_w4a8_g64 %ux%ux%u add=%d: %s (max_err=%.2g, argmax=%u/%u)\n",
 			       m, k, n, add, bad ? "FAIL" : "PASS", max_e, arg_got, arg_want);
 			if (bad) fail = 1;
