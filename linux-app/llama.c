@@ -8,12 +8,19 @@
  */
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "c7x_ai.h"
@@ -1754,7 +1761,7 @@ static int cmd_llama_run(int argc, char **argv)
 
 	double t0 = now_us();
 	uint32_t decoded = 0u;
-	uint32_t token = pf_toks[0];
+	uint32_t token = (uint32_t)prompt_tokens[0];
 	uint32_t pos = 0u;
 
 	/* Fast batched MMA prefill when prompt has >1 tokens */
@@ -2091,21 +2098,1192 @@ static int cmd_llama_spec(int argc, char **argv)
 	return 0;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Chat template auto-detection, stop-token set & repetition penalty          */
+/* -------------------------------------------------------------------------- */
+
+enum chat_template_kind {
+	CHAT_TPL_RAW = 0,
+	CHAT_TPL_CHATML = 1, /* Qwen2.5, Qwen3, SmolLM2 (<|im_start|> / <|im_end|>) */
+	CHAT_TPL_LLAMA3 = 2  /* Llama-3 (<|start_header_id|> / <|eot_id|>) */
+};
+
+struct chat_config {
+	enum chat_template_kind kind;
+	int has_think;
+	uint32_t stop_ids[8];
+	uint32_t n_stop;
+};
+
+static int c7t_find_special_id(const struct tokenizer *t, const char *lit)
+{
+	if (!t->is_c7t || !lit) {
+		return -1;
+	}
+	size_t llen = strlen(lit);
+	for (uint32_t i = 0u; i < t->c7t_n_special; i++) {
+		if (t->c7t_specials[i].str_len == llen &&
+		    memcmp(t->c7t_pieces + t->c7t_specials[i].str_off, lit, llen) == 0) {
+			return (int)t->c7t_specials[i].id;
+		}
+	}
+	return -1;
+}
+
+static void chat_add_stop(struct chat_config *cc, int id)
+{
+	if (id < 0 || cc->n_stop >= 8u) {
+		return;
+	}
+	for (uint32_t i = 0u; i < cc->n_stop; i++) {
+		if (cc->stop_ids[i] == (uint32_t)id) {
+			return;
+		}
+	}
+	cc->stop_ids[cc->n_stop++] = (uint32_t)id;
+}
+
+static int chat_is_stop(const struct chat_config *cc, uint32_t tok_id)
+{
+	for (uint32_t i = 0u; i < cc->n_stop; i++) {
+		if (cc->stop_ids[i] == tok_id) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void detect_chat_template(struct chat_config *cc, const struct tokenizer *t,
+				 const struct c7m_header *hdr)
+{
+	memset(cc, 0, sizeof(*cc));
+	cc->kind = CHAT_TPL_RAW;
+	chat_add_stop(cc, (int)(hdr->eos_token_id ? hdr->eos_token_id : 2u));
+
+	if (t && t->is_c7t) {
+		int im_start = c7t_find_special_id(t, "<|im_start|>");
+		int im_end   = c7t_find_special_id(t, "<|im_end|>");
+		int eot      = c7t_find_special_id(t, "<|eot_id|>");
+		int hdr_st   = c7t_find_special_id(t, "<|start_header_id|>");
+		int eotext   = c7t_find_special_id(t, "<|endoftext|>");
+		int eoftext  = c7t_find_special_id(t, "<|end_of_text|>");
+		int think_s  = c7t_find_special_id(t, "<think>");
+		int think_e  = c7t_find_special_id(t, "</think>");
+
+		if (im_start >= 0 && im_end >= 0) {
+			cc->kind = CHAT_TPL_CHATML;
+			chat_add_stop(cc, im_end);
+			chat_add_stop(cc, im_start);
+			chat_add_stop(cc, eotext);
+			if (think_s >= 0 && think_e >= 0) {
+				cc->has_think = 1;
+			}
+		} else if (hdr_st >= 0 && eot >= 0) {
+			cc->kind = CHAT_TPL_LLAMA3;
+			chat_add_stop(cc, eot);
+			chat_add_stop(cc, eoftext);
+		} else {
+			chat_add_stop(cc, eotext);
+			chat_add_stop(cc, eoftext);
+		}
+	} else {
+		chat_add_stop(cc, 1); /* BOS in llama2.c */
+	}
+}
+
+static const char *chat_template_name(const struct chat_config *cc)
+{
+	if (cc->kind == CHAT_TPL_CHATML) {
+		return cc->has_think ? "chatml (Qwen3 think-capable)" : "chatml (Qwen2/SmolLM2)";
+	}
+	if (cc->kind == CHAT_TPL_LLAMA3) {
+		return "llama3";
+	}
+	return "raw";
+}
+
+static void apply_rep_penalty(float *logits, uint32_t vocab_size,
+			      const uint32_t *hist, uint32_t hist_len, float penalty)
+{
+	if (penalty <= 1.0f || hist_len == 0u) {
+		return;
+	}
+	uint32_t start = (hist_len > 64u) ? (hist_len - 64u) : 0u;
+	for (uint32_t i = start; i < hist_len; i++) {
+		uint32_t id = hist[i];
+		if (id < vocab_size) {
+			/* Avoid penalizing the same token multiple times */
+			int seen = 0;
+			for (uint32_t j = start; j < i; j++) {
+				if (hist[j] == id) {
+					seen = 1;
+					break;
+				}
+			}
+			if (!seen) {
+				if (logits[id] > 0.0f) {
+					logits[id] /= penalty;
+				} else {
+					logits[id] *= penalty;
+				}
+			}
+		}
+	}
+}
+
+static uint32_t sample_logits_with_penalty(float *logits, uint32_t vocab_size,
+					   float temp, float topp, float rep_penalty,
+					   const uint32_t *hist, uint32_t hist_len)
+{
+	apply_rep_penalty(logits, vocab_size, hist, hist_len, rep_penalty);
+	if (temp <= 0.0f) {
+		return argmax_f32(logits, vocab_size);
+	}
+	return sample_topp(logits, vocab_size, temp, topp);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Subcommand: c7x-ai llama info <model.c7m>                                  */
+/* -------------------------------------------------------------------------- */
+
+static int cmd_llama_info(int argc, char **argv)
+{
+	if (argc < 4) {
+		fprintf(stderr, "usage: c7x-ai llama info <model.c7m>\n");
+		return 2;
+	}
+	const char *model_path = argv[3];
+	FILE *f = fopen(model_path, "rb");
+	if (!f) {
+		perror(model_path);
+		return 1;
+	}
+	fseek(f, 0, SEEK_END);
+	long fsz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+
+	struct c7m_header hdr;
+	if (fsz < (long)sizeof(hdr) || fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+		fprintf(stderr, "failed reading .c7m header from %s\n", model_path);
+		fclose(f);
+		return 1;
+	}
+	if (hdr.magic != C7M_MAGIC || hdr.version != C7M_VERSION) {
+		fprintf(stderr, "invalid .c7m file (magic=0x%08x ver=%u)\n", hdr.magic, hdr.version);
+		fclose(f);
+		return 1;
+	}
+
+	uint32_t q_dim = hdr.n_heads * hdr.head_size;
+	const char *quant_str = "W8A8 row-major";
+	if ((hdr.flags & C7M_FLAG_W4A8_LAYERS) && (hdr.flags & C7M_FLAG_W4A8_WCLS)) {
+		quant_str = "W4A8 group-64 (layers + classifier)";
+	} else if (hdr.flags & C7M_FLAG_W4A8_WCLS) {
+		quant_str = "Hybrid (W8A8 tiled layers + W4A8-g64 classifier)";
+	} else if (hdr.flags & C7M_FLAG_TILED_WEIGHTS) {
+		quant_str = "W8A8 64x64 tile-major";
+	}
+
+	size_t kv_fp32_bytes = 2u * (size_t)hdr.n_layers * hdr.seq_len * hdr.kv_dim * sizeof(float);
+	size_t kv_int8_bytes = 2u * ((size_t)hdr.n_layers * hdr.seq_len * hdr.kv_dim +
+				     (size_t)hdr.n_layers * hdr.seq_len * hdr.n_kv_heads * sizeof(float));
+	uint32_t msmc_fit = 0u;
+	if (hdr.layer_stride > 0u) {
+		msmc_fit = C7X_MSMC_SIZE / hdr.layer_stride;
+		if (msmc_fit > hdr.n_layers) {
+			msmc_fit = hdr.n_layers;
+		}
+	}
+
+	struct tokenizer tok;
+	struct chat_config cc;
+	memset(&tok, 0, sizeof(tok));
+	if (hdr.off_tokenizer != 0u && hdr.tokenizer_size > 0u &&
+	    (size_t)hdr.off_tokenizer + hdr.tokenizer_size <= (size_t)fsz) {
+		uint8_t *tbuf = malloc(hdr.tokenizer_size);
+		if (tbuf) {
+			fseek(f, (long)hdr.off_tokenizer, SEEK_SET);
+			if (fread(tbuf, 1, hdr.tokenizer_size, f) == hdr.tokenizer_size) {
+				tokenizer_load_c7t(&tok, tbuf, hdr.tokenizer_size);
+			}
+			free(tbuf);
+		}
+	}
+	fclose(f);
+	detect_chat_template(&cc, tok.is_c7t ? &tok : NULL, &hdr);
+
+	printf("Model:          %s\n", model_path);
+	printf("File size:      %.2f MiB (%ld bytes)\n", (double)fsz / (1024.0 * 1024.0), fsz);
+	printf("Format:         C7M1 v%u | %s | flags=0x%02x\n", hdr.version, quant_str, hdr.flags);
+	printf("Dimensions:     dim=%u (pad %u), q_dim=%u, hidden=%u (pad %u)\n",
+	       hdr.dim, hdr.dim_pad, q_dim, hdr.hidden_dim, hdr.hidden_pad);
+	printf("Layers/Heads:   layers=%u, heads=%u, kv_heads=%u (GQA %u:1), head_size=%u, kv_dim=%u\n",
+	       hdr.n_layers, hdr.n_heads, hdr.n_kv_heads,
+	       hdr.n_kv_heads ? (hdr.n_heads / hdr.n_kv_heads) : 0u,
+	       hdr.head_size, hdr.kv_dim);
+	printf("Vocab/Context:  vocab=%u (pad %u), max_seq_len=%u, bos=%u, eos=%u\n",
+	       hdr.vocab_size, hdr.vocab_pad, hdr.seq_len,
+	       hdr.bos_token_id ? hdr.bos_token_id : 1u,
+	       hdr.eos_token_id ? hdr.eos_token_id : 2u);
+	printf("Arch features:  RoPE=%s, eps=%.2g, QKV_bias=%s, QK_norm=%s, embeddings=%s\n",
+	       (hdr.flags & C7M_FLAG_ROPE_NEOX) ? "NeoX-half" : "interleaved",
+	       hdr.rms_norm_eps > 0.0f ? hdr.rms_norm_eps : 1e-5f,
+	       (hdr.flags & C7M_FLAG_HAS_QKV_BIAS) ? "yes" : "no",
+	       (hdr.flags & C7M_FLAG_HAS_QK_NORM) ? "yes" : "no",
+	       (hdr.flags & C7M_FLAG_UNTIED_EMB) ? "untied-INT8" : "tied");
+	if (tok.is_c7t) {
+		printf("Tokenizer:      embedded C7T1 (%.2f MiB, vocab=%u, specials=%u, merges=%u, %s)\n",
+		       (double)hdr.tokenizer_size / (1024.0 * 1024.0),
+		       tok.c7t_vocab, tok.c7t_n_special, tok.c7t_n_merges,
+		       (tok.c7t_flags & 1u) ? "byte-level BPE" : "BPE");
+	} else {
+		printf("Tokenizer:      external (pass tokenizer.bin)\n");
+	}
+	printf("Chat template:  %s\n", chat_template_name(&cc));
+	printf("KV cache:       FP32 = %.2f MiB | INT8 = %.2f MiB (%.2fx smaller; auto=%s)\n",
+	       (double)kv_fp32_bytes / (1024.0 * 1024.0),
+	       (double)kv_int8_bytes / (1024.0 * 1024.0),
+	       kv_int8_bytes ? ((double)kv_fp32_bytes / (double)kv_int8_bytes) : 0.0,
+	       (hdr.seq_len >= 1024u) ? "int8" : "fp32");
+	printf("MSMC SRAM:      %u / %u layers fit (layer_stride=%.2f MiB, staged=%.2f / %.3f MiB)\n",
+	       msmc_fit, hdr.n_layers,
+	       (double)hdr.layer_stride / (1024.0 * 1024.0),
+	       (double)msmc_fit * hdr.layer_stride / (1024.0 * 1024.0),
+	       (double)C7X_MSMC_SIZE / (1024.0 * 1024.0));
+	printf("DDR footprint:  %.2f MiB (INT8 KV) / %.2f MiB (FP32 KV) + 32 MiB prefill scratch\n",
+	       (double)(fsz + (long)kv_int8_bytes) / (1024.0 * 1024.0),
+	       (double)(fsz + (long)kv_fp32_bytes) / (1024.0 * 1024.0));
+
+	tokenizer_free(&tok);
+	return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Subcommand: c7x-ai llama chat <model.c7m> (interactive multi-turn REPL)    */
+/* -------------------------------------------------------------------------- */
+
+static void arena_clear_kv(struct llama_arena *a)
+{
+	mmio_zero(a->ddr + a->off_k_cache, a->kv_bytes);
+	mmio_zero(a->ddr + a->off_v_cache, a->kv_bytes);
+	if (a->kv_scale_bytes > 0u) {
+		mmio_zero(a->ddr + a->off_k_scale, a->kv_scale_bytes);
+		mmio_zero(a->ddr + a->off_v_scale, a->kv_scale_bytes);
+	}
+}
+
+static int cmd_llama_chat(int argc, char **argv)
+{
+	if (argc < 4) {
+		fprintf(stderr,
+			"usage: c7x-ai llama chat <model.c7m> [-t temp] [-P topp] [--rep-penalty f]\n"
+			"                         [-n max_tokens] [--system msg] [--kv-int8|--kv-fp32] [--think|--no-think]\n");
+		return 2;
+	}
+	const char *model_path = argv[3];
+	const char *sys_msg    = "You are a helpful, concise assistant running locally on a BeagleBone AI-64 C7x DSP.";
+	float temp             = 0.7f;
+	float topp             = 0.9f;
+	float rep_penalty      = 1.1f;
+	int rep_penalty_set    = 0;
+	uint32_t max_new       = 256u;
+	int kv_mode            = -1;
+	int no_think           = 1;
+
+	for (int i = 4; i < argc; i++) {
+		if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+			temp = (float)atof(argv[++i]);
+		} else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
+			topp = (float)atof(argv[++i]);
+		} else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) {
+			rep_penalty = (float)atof(argv[++i]);
+			rep_penalty_set = 1;
+		} else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+			max_new = (uint32_t)atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
+			sys_msg = argv[++i];
+		} else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+			g_sample_rng = (uint64_t)strtoull(argv[++i], NULL, 10) | 1ull;
+		} else if (strcmp(argv[i], "--kv-int8") == 0) {
+			kv_mode = 1;
+		} else if (strcmp(argv[i], "--kv-fp32") == 0) {
+			kv_mode = 0;
+		} else if (strcmp(argv[i], "--think") == 0) {
+			no_think = 0;
+		} else if (strcmp(argv[i], "--no-think") == 0) {
+			no_think = 1;
+		}
+	}
+	if (!rep_penalty_set && temp <= 0.0f) {
+		rep_penalty = 1.0f;
+	}
+
+	struct llama_arena a;
+	struct tokenizer tok;
+	struct chat_config cc;
+
+	if (arena_load_model(&a, model_path, kv_mode) != 0) {
+		return 1;
+	}
+	if (!a.embedded_tok || tokenizer_load_c7t(&tok, a.embedded_tok, a.embedded_tok_size) != 0) {
+		fprintf(stderr, "c7x-ai llama chat requires a .c7m with an embedded C7T1 tokenizer\n");
+		arena_close(&a);
+		return 1;
+	}
+	detect_chat_template(&cc, &tok, &a.hdr);
+	printf("[chat] template=%s | temp=%.2f topp=%.2f rep_penalty=%.2f | max_ctx=%u | commands: /reset /stats /quit\n",
+	       chat_template_name(&cc), temp, topp, rep_penalty, a.hdr.seq_len);
+
+	float *logits = malloc((size_t)a.hdr.vocab_size * sizeof(float));
+	int *enc_buf = malloc(4096u * sizeof(int));
+	uint32_t *pf_toks = malloc(4096u * sizeof(uint32_t));
+	uint32_t *hist = malloc(a.hdr.seq_len * sizeof(uint32_t));
+	char *line = malloc(16384u);
+	char *turn_str = malloc(32768u);
+
+	uint32_t cur_pos = 0u;
+	uint32_t turns = 0u;
+	uint64_t total_pf_toks = 0u, total_gen_toks = 0u;
+	double total_pf_s = 0.0, total_gen_s = 0.0;
+	int need_turn_close = 0;
+
+	while (1) {
+		printf("\nYou> ");
+		fflush(stdout);
+		if (!fgets(line, 16384, stdin)) {
+			printf("\n");
+			break;
+		}
+		size_t llen = strlen(line);
+		while (llen > 0u && (line[llen - 1u] == '\n' || line[llen - 1u] == '\r')) {
+			line[--llen] = '\0';
+		}
+		if (llen == 0u) {
+			continue;
+		}
+		if (strcmp(line, "/quit") == 0 || strcmp(line, "/exit") == 0) {
+			break;
+		}
+		if (strcmp(line, "/reset") == 0) {
+			arena_clear_kv(&a);
+			cur_pos = 0u;
+			turns = 0u;
+			need_turn_close = 0;
+			printf("[chat] KV cache cleared (pos=0/%u)\n", a.hdr.seq_len);
+			continue;
+		}
+		if (strcmp(line, "/stats") == 0) {
+			printf("[chat] turns=%u | KV pos=%u/%u (%s) | prefill=%" PRIu64 " tok (%.1f tok/s) | decode=%" PRIu64 " tok (%.2f tok/s)\n",
+			       turns, cur_pos, a.hdr.seq_len, a.kv_int8 ? "int8" : "fp32",
+			       total_pf_toks, total_pf_s > 0.0 ? ((double)total_pf_toks / total_pf_s) : 0.0,
+			       total_gen_toks, total_gen_s > 0.0 ? ((double)total_gen_toks / total_gen_s) : 0.0);
+			continue;
+		}
+
+		/* Format ONLY the incremental delta for this turn so persistent KV cache is reused! */
+		size_t toff = 0u;
+		if (cc.kind == CHAT_TPL_CHATML) {
+			if (need_turn_close) {
+				toff += (size_t)snprintf(turn_str + toff, 32768u - toff, "<|im_end|>\n");
+			}
+			if (cur_pos == 0u && sys_msg && sys_msg[0]) {
+				toff += (size_t)snprintf(turn_str + toff, 32768u - toff,
+							 "<|im_start|>system\n%s<|im_end|>\n", sys_msg);
+			}
+			toff += (size_t)snprintf(turn_str + toff, 32768u - toff,
+						 "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s",
+						 line, (cc.has_think && no_think) ? "<think>\n</think>\n\n" : "");
+		} else if (cc.kind == CHAT_TPL_LLAMA3) {
+			if (need_turn_close) {
+				toff += (size_t)snprintf(turn_str + toff, 32768u - toff, "<|eot_id|>");
+			}
+			if (cur_pos == 0u && sys_msg && sys_msg[0]) {
+				toff += (size_t)snprintf(turn_str + toff, 32768u - toff,
+							 "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n%s<|eot_id|>",
+							 sys_msg);
+			}
+			toff += (size_t)snprintf(turn_str + toff, 32768u - toff,
+						 "<|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
+						 "<|start_header_id|>assistant<|end_header_id|>\n\n", line);
+		} else {
+			if (cur_pos == 0u && sys_msg && sys_msg[0]) {
+				toff += (size_t)snprintf(turn_str + toff, 32768u - toff, "%s\n\n", sys_msg);
+			}
+			toff += (size_t)snprintf(turn_str + toff, 32768u - toff, "User: %s\nAssistant: ", line);
+		}
+
+		int n_new = tokenizer_encode(&tok, turn_str, 0, 0, enc_buf, 4096);
+		if (n_new <= 0) {
+			continue;
+		}
+		if (cur_pos + (uint32_t)n_new + 4u >= a.hdr.seq_len) {
+			printf("[chat] context full (%u/%u); auto-resetting KV cache.\n", cur_pos, a.hdr.seq_len);
+			arena_clear_kv(&a);
+			cur_pos = 0u;
+			need_turn_close = 0;
+			continue;
+		}
+		for (int i = 0; i < n_new; i++) {
+			pf_toks[i] = (uint32_t)enc_buf[i];
+			hist[cur_pos + (uint32_t)i] = pf_toks[i];
+		}
+
+		int need_logits = (temp > 0.0f || rep_penalty > 1.0f);
+		uint32_t argmax = 0u;
+		double pf_wall_us = 0.0;
+		struct c7x_llama_prof pf_prof;
+
+		if (arena_prefill_tokens(&a, pf_toks, (uint32_t)n_new, cur_pos,
+					 need_logits ? logits : NULL, &argmax,
+					 &pf_prof, &pf_wall_us) != 0) {
+			fprintf(stderr, "[chat] prefill failed\n");
+			break;
+		}
+		cur_pos += (uint32_t)n_new;
+		total_pf_toks += (uint64_t)n_new;
+		total_pf_s += pf_wall_us / 1e6;
+
+		uint32_t nxt = need_logits
+			       ? sample_logits_with_penalty(logits, a.hdr.vocab_size, temp, topp,
+							    rep_penalty, hist, cur_pos)
+			       : argmax;
+
+		printf("Assistant> ");
+		fflush(stdout);
+
+		double t_gen0 = now_us();
+		uint32_t gen_n = 0u;
+		uint32_t prev_tok = pf_toks[n_new - 1];
+		int stopped = chat_is_stop(&cc, nxt);
+
+		while (!stopped && gen_n < max_new && cur_pos < a.hdr.seq_len - 2u) {
+			fputs(tokenizer_decode(&tok, (int)prev_tok, (int)nxt), stdout);
+			fflush(stdout);
+			hist[cur_pos] = nxt;
+			gen_n++;
+
+			double step_us = 0.0;
+			uint32_t next_arg = 0u;
+			if (arena_forward_token(&a, nxt, cur_pos,
+						need_logits ? logits : NULL, &next_arg,
+						NULL, -1, 0u, NULL, &step_us) != 0) {
+				break;
+			}
+			cur_pos++;
+			prev_tok = nxt;
+			nxt = need_logits
+			      ? sample_logits_with_penalty(logits, a.hdr.vocab_size, temp, topp,
+							   rep_penalty, hist, cur_pos)
+			      : next_arg;
+			if (chat_is_stop(&cc, nxt)) {
+				stopped = 1;
+				break;
+			}
+		}
+
+		double gen_s = (now_us() - t_gen0) / 1e6;
+		total_gen_toks += gen_n;
+		total_gen_s += gen_s;
+		turns++;
+		need_turn_close = 1;
+
+		printf("\n");
+		fflush(stdout);
+		fprintf(stderr, "[turn %u | +%d prefill (%.1f tok/s) | %u gen (%.2f tok/s) | kv=%u/%u]\n",
+			turns, n_new, (double)n_new / (pf_wall_us / 1e6),
+			gen_n, gen_s > 0.0 ? ((double)gen_n / gen_s) : 0.0,
+			cur_pos, a.hdr.seq_len);
+		fflush(stderr);
+	}
+
+	free(logits);
+	free(enc_buf);
+	free(pf_toks);
+	free(hist);
+	free(line);
+	free(turn_str);
+	tokenizer_free(&tok);
+	arena_close(&a);
+	return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Subcommand: c7x-ai serve <model.c7m> (OpenAI HTTP/1.1 + SSE API server)    */
+/* -------------------------------------------------------------------------- */
+
+static volatile sig_atomic_t g_serve_stop = 0;
+
+static void serve_sig_handler(int sig)
+{
+	(void)sig;
+	g_serve_stop = 1;
+}
+
+static int sock_send_all(int fd, const void *buf, size_t len)
+{
+	const uint8_t *p = (const uint8_t *)buf;
+	size_t sent = 0u;
+
+	while (sent < len) {
+		ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR) continue;
+			return -1;
+		}
+		sent += (size_t)n;
+	}
+	return 0;
+}
+
+static size_t json_escape_str(char *dst, size_t dst_cap, const char *src)
+{
+	size_t o = 0u;
+	for (const unsigned char *s = (const unsigned char *)src; *s && o + 7u < dst_cap; s++) {
+		unsigned char c = *s;
+		if (c == '"') {
+			dst[o++] = '\\'; dst[o++] = '"';
+		} else if (c == '\\') {
+			dst[o++] = '\\'; dst[o++] = '\\';
+		} else if (c == '\n') {
+			dst[o++] = '\\'; dst[o++] = 'n';
+		} else if (c == '\r') {
+			dst[o++] = '\\'; dst[o++] = 'r';
+		} else if (c == '\t') {
+			dst[o++] = '\\'; dst[o++] = 't';
+		} else if (c < 0x20u) {
+			o += (size_t)snprintf(dst + o, dst_cap - o, "\\u%04x", (unsigned)c);
+		} else {
+			dst[o++] = (char)c;
+		}
+	}
+	dst[o] = '\0';
+	return o;
+}
+
+/* Skip whitespace and parse a JSON string starting at *pp (which must point to '"'). */
+static int json_parse_string(const char **pp, char *out, size_t out_cap)
+{
+	const char *p = *pp;
+	size_t o = 0u;
+
+	if (*p != '"') {
+		return -1;
+	}
+	p++;
+	while (*p && *p != '"') {
+		if (*p == '\\' && p[1]) {
+			p++;
+			char c = *p++;
+			char dec = c;
+			if (c == 'n') dec = '\n';
+			else if (c == 'r') dec = '\r';
+			else if (c == 't') dec = '\t';
+			else if (c == 'b') dec = '\b';
+			else if (c == 'f') dec = '\f';
+			else if (c == 'u' && p[0] && p[1] && p[2] && p[3]) {
+				char hex[5] = { p[0], p[1], p[2], p[3], '\0' };
+				unsigned cp = (unsigned)strtoul(hex, NULL, 16);
+				p += 4;
+				if (cp < 0x80u && o + 1u < out_cap) {
+					out[o++] = (char)cp;
+				} else if (cp < 0x800u && o + 2u < out_cap) {
+					out[o++] = (char)(0xC0u | (cp >> 6));
+					out[o++] = (char)(0x80u | (cp & 0x3Fu));
+				} else if (o + 3u < out_cap) {
+					out[o++] = (char)(0xE0u | (cp >> 12));
+					out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+					out[o++] = (char)(0x80u | (cp & 0x3Fu));
+				}
+				continue;
+			}
+			if (o + 1u < out_cap) out[o++] = dec;
+		} else {
+			if (o + 1u < out_cap) out[o++] = *p;
+			p++;
+		}
+	}
+	if (*p == '"') {
+		p++;
+	}
+	out[o] = '\0';
+	*pp = p;
+	return 0;
+}
+
+static const char *json_find_key(const char *json, const char *key)
+{
+	char pat[128];
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	const char *p = json;
+	size_t plen = strlen(pat);
+
+	while ((p = strstr(p, pat)) != NULL) {
+		const char *q = p + plen;
+		while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+		if (*q == ':') {
+			q++;
+			while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+			return q;
+		}
+		p += plen;
+	}
+	return NULL;
+}
+
+static int json_get_bool(const char *json, const char *key, int def_val)
+{
+	const char *v = json_find_key(json, key);
+	if (!v) return def_val;
+	if (strncmp(v, "true", 4) == 0) return 1;
+	if (strncmp(v, "false", 5) == 0) return 0;
+	return def_val;
+}
+
+static float json_get_float(const char *json, const char *key, float def_val)
+{
+	const char *v = json_find_key(json, key);
+	if (!v) return def_val;
+	char *end = NULL;
+	float x = strtof(v, &end);
+	return (end && end != v) ? x : def_val;
+}
+
+static int json_get_int(const char *json, const char *key, int def_val)
+{
+	const char *v = json_find_key(json, key);
+	if (!v) return def_val;
+	char *end = NULL;
+	long x = strtol(v, &end, 10);
+	return (end && end != v) ? (int)x : def_val;
+}
+
+/* Format OpenAI "messages": [{"role":..., "content":...}, ...] into model prompt. */
+static int format_openai_messages(const char *json, const struct chat_config *cc,
+				  int no_think, char *out, size_t out_cap)
+{
+	const char *m = json_find_key(json, "messages");
+	if (!m || *m != '[') {
+		return -1;
+	}
+	m++;
+	size_t o = 0u;
+	int count = 0;
+	char role[64], content[32768];
+
+	if (cc->kind == CHAT_TPL_LLAMA3) {
+		o += (size_t)snprintf(out + o, out_cap - o, "<|begin_of_text|>");
+	}
+
+	while (*m) {
+		while (*m && *m != '{' && *m != ']') m++;
+		if (*m != '{') break;
+		/* Find matching closing '}' respecting strings */
+		const char *obj_start = m;
+		int depth = 0, in_str = 0;
+		while (*m) {
+			if (*m == '"' && (m == obj_start || m[-1] != '\\')) {
+				in_str = !in_str;
+			} else if (!in_str) {
+				if (*m == '{') depth++;
+				else if (*m == '}') {
+					depth--;
+					if (depth == 0) {
+						m++;
+						break;
+					}
+				}
+			}
+			m++;
+		}
+		size_t obj_len = (size_t)(m - obj_start);
+		char *obj = malloc(obj_len + 1u);
+		if (!obj) break;
+		memcpy(obj, obj_start, obj_len);
+		obj[obj_len] = '\0';
+
+		role[0] = '\0';
+		content[0] = '\0';
+		const char *rv = json_find_key(obj, "role");
+		const char *cv = json_find_key(obj, "content");
+		if (rv && *rv == '"') json_parse_string(&rv, role, sizeof(role));
+		if (cv && *cv == '"') json_parse_string(&cv, content, sizeof(content));
+		free(obj);
+
+		if (!role[0]) snprintf(role, sizeof(role), "user");
+
+		if (cc->kind == CHAT_TPL_CHATML) {
+			o += (size_t)snprintf(out + o, out_cap - o, "<|im_start|>%s\n%s<|im_end|>\n",
+					      role, content);
+		} else if (cc->kind == CHAT_TPL_LLAMA3) {
+			o += (size_t)snprintf(out + o, out_cap - o,
+					      "<|start_header_id|>%s<|end_header_id|>\n\n%s<|eot_id|>",
+					      role, content);
+		} else {
+			o += (size_t)snprintf(out + o, out_cap - o, "%s: %s\n", role, content);
+		}
+		count++;
+	}
+	if (count == 0) {
+		return -1;
+	}
+	if (cc->kind == CHAT_TPL_CHATML) {
+		o += (size_t)snprintf(out + o, out_cap - o, "<|im_start|>assistant\n%s",
+				      (cc->has_think && no_think) ? "<think>\n</think>\n\n" : "");
+	} else if (cc->kind == CHAT_TPL_LLAMA3) {
+		o += (size_t)snprintf(out + o, out_cap - o,
+				      "<|start_header_id|>assistant<|end_header_id|>\n\n");
+	} else {
+		o += (size_t)snprintf(out + o, out_cap - o, "assistant: ");
+	}
+	return 0;
+}
+
+static void send_http_json(int fd, int status, const char *status_text, const char *body)
+{
+	char hdr[512];
+	size_t blen = strlen(body);
+	int hlen = snprintf(hdr, sizeof(hdr),
+			    "HTTP/1.1 %d %s\r\n"
+			    "Content-Type: application/json\r\n"
+			    "Content-Length: %zu\r\n"
+			    "Access-Control-Allow-Origin: *\r\n"
+			    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+			    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+			    "Connection: close\r\n\r\n",
+			    status, status_text, blen);
+	sock_send_all(fd, hdr, (size_t)hlen);
+	sock_send_all(fd, body, blen);
+}
+
+int cmd_serve(int argc, char **argv)
+{
+	if (argc < 3) {
+		fprintf(stderr, "usage: c7x-ai serve <model.c7m> [--host 0.0.0.0] [--port 8080] [--kv-int8|--kv-fp32] [--think|--no-think]\n");
+		return 2;
+	}
+	const char *model_path = argv[2];
+	const char *host       = "0.0.0.0";
+	int port               = 8080;
+	int kv_mode            = -1;
+	int no_think           = 1;
+
+	for (int i = 3; i < argc; i++) {
+		if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+			host = argv[++i];
+		} else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+			port = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--kv-int8") == 0) {
+			kv_mode = 1;
+		} else if (strcmp(argv[i], "--kv-fp32") == 0) {
+			kv_mode = 0;
+		} else if (strcmp(argv[i], "--think") == 0) {
+			no_think = 0;
+		} else if (strcmp(argv[i], "--no-think") == 0) {
+			no_think = 1;
+		}
+	}
+
+	struct llama_arena a;
+	struct tokenizer tok;
+	struct chat_config cc;
+
+	if (arena_load_model(&a, model_path, kv_mode) != 0) {
+		return 1;
+	}
+	if (!a.embedded_tok || tokenizer_load_c7t(&tok, a.embedded_tok, a.embedded_tok_size) != 0) {
+		fprintf(stderr, "c7x-ai serve requires a .c7m with an embedded C7T1 tokenizer\n");
+		arena_close(&a);
+		return 1;
+	}
+	detect_chat_template(&cc, &tok, &a.hdr);
+
+	const char *model_name = strrchr(model_path, '/');
+	model_name = model_name ? (model_name + 1) : model_path;
+
+	signal(SIGPIPE, SIG_IGN);
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = serve_sig_handler;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = 0; /* no SA_RESTART so accept() unblocks cleanly on SIGINT/SIGTERM */
+		sigaction(SIGINT, &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+	}
+
+	int srv = socket(AF_INET, SOCK_STREAM, 0);
+	if (srv < 0) {
+		perror("socket");
+		tokenizer_free(&tok);
+		arena_close(&a);
+		return 1;
+	}
+	int one = 1;
+	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+		addr.sin_addr.s_addr = INADDR_ANY;
+	}
+	if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+		perror("bind");
+		close(srv);
+		tokenizer_free(&tok);
+		arena_close(&a);
+		return 1;
+	}
+	if (listen(srv, 16) != 0) {
+		perror("listen");
+		close(srv);
+		tokenizer_free(&tok);
+		arena_close(&a);
+		return 1;
+	}
+
+	printf("[serve] listening on http://%s:%d | model=%s | template=%s | kv=%s | seq=%u\n",
+	       host, port, model_name, chat_template_name(&cc),
+	       a.kv_int8 ? "int8" : "fp32", a.hdr.seq_len);
+	printf("[serve] endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\n");
+	fflush(stdout);
+
+	float *logits = malloc((size_t)a.hdr.vocab_size * sizeof(float));
+	int *enc_buf = malloc(4096u * sizeof(int));
+	uint32_t *pf_toks = malloc(4096u * sizeof(uint32_t));
+	uint32_t *kv_hist = malloc(4096u * sizeof(uint32_t));
+	uint32_t kv_hist_len = 0u;
+	char *req_buf = malloc(262144u);
+	char *prompt_buf = malloc(65536u);
+	char *out_text = malloc(131072u);
+	char *esc_buf = malloc(262144u);
+	char *resp_buf = malloc(300000u);
+	uint64_t req_counter = 0u;
+
+	while (!g_serve_stop) {
+		struct sockaddr_in cli_addr;
+		socklen_t cli_len = sizeof(cli_addr);
+		int cfd = accept(srv, (struct sockaddr *)&cli_addr, &cli_len);
+		if (cfd < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+
+		/* Read HTTP headers + Content-Length body */
+		size_t got = 0u;
+		char *hdr_end = NULL;
+		size_t content_len = 0u;
+		while (got + 1u < 262144u) {
+			ssize_t n = recv(cfd, req_buf + got, 262143u - got, 0);
+			if (n <= 0) break;
+			got += (size_t)n;
+			req_buf[got] = '\0';
+			if (!hdr_end) {
+				hdr_end = strstr(req_buf, "\r\n\r\n");
+				if (hdr_end) {
+					const char *cl = strcasestr(req_buf, "Content-Length:");
+					if (cl && cl < hdr_end) {
+						content_len = (size_t)strtoull(cl + 15, NULL, 10);
+					}
+				}
+			}
+			if (hdr_end) {
+				size_t body_got = got - (size_t)((hdr_end + 4) - req_buf);
+				if (body_got >= content_len) break;
+			}
+		}
+		if (!hdr_end) {
+			close(cfd);
+			continue;
+		}
+
+		char method[16] = { 0 }, path[256] = { 0 };
+		sscanf(req_buf, "%15s %255s", method, path);
+		const char *body = hdr_end + 4;
+
+		if (strcmp(method, "OPTIONS") == 0) {
+			const char *opt_resp =
+				"HTTP/1.1 204 No Content\r\n"
+				"Access-Control-Allow-Origin: *\r\n"
+				"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+				"Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+				"Connection: close\r\n\r\n";
+			sock_send_all(cfd, opt_resp, strlen(opt_resp));
+			close(cfd);
+			continue;
+		}
+
+		if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
+			char j[512];
+			snprintf(j, sizeof(j), "{\"status\":\"ok\",\"model\":\"%s\",\"kv\":\"%s\",\"seq_len\":%u}\n",
+				 model_name, a.kv_int8 ? "int8" : "fp32", a.hdr.seq_len);
+			send_http_json(cfd, 200, "OK", j);
+			close(cfd);
+			continue;
+		}
+
+		if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
+			char j[1024];
+			snprintf(j, sizeof(j),
+				 "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\","
+				 "\"created\":%ld,\"owned_by\":\"c7x-ai\"}]}\n",
+				 model_name, (long)time(NULL));
+			send_http_json(cfd, 200, "OK", j);
+			close(cfd);
+			continue;
+		}
+
+		int is_chat = (strcmp(method, "POST") == 0 && strcmp(path, "/v1/chat/completions") == 0);
+		int is_comp = (strcmp(method, "POST") == 0 && strcmp(path, "/v1/completions") == 0);
+		if (!is_chat && !is_comp) {
+			send_http_json(cfd, 404, "Not Found", "{\"error\":{\"message\":\"Not found\"}}\n");
+			close(cfd);
+			continue;
+		}
+
+		int stream       = json_get_bool(body, "stream", 0);
+		int max_tokens   = json_get_int(body, "max_tokens", 256);
+		float temp       = json_get_float(body, "temperature", 0.0f);
+		float topp       = json_get_float(body, "top_p", 0.9f);
+		float rep_pen    = json_get_float(body, "repetition_penalty", 1.0f);
+		if (max_tokens < 1) max_tokens = 1;
+		if ((uint32_t)max_tokens > a.hdr.seq_len) max_tokens = (int)a.hdr.seq_len;
+
+		prompt_buf[0] = '\0';
+		if (is_chat) {
+			if (format_openai_messages(body, &cc, no_think, prompt_buf, 65536u) != 0) {
+				send_http_json(cfd, 400, "Bad Request",
+					       "{\"error\":{\"message\":\"Invalid or missing messages array\"}}\n");
+				close(cfd);
+				continue;
+			}
+		} else {
+			const char *pv = json_find_key(body, "prompt");
+			if (!pv || *pv != '"' || json_parse_string(&pv, prompt_buf, 65536u) != 0) {
+				send_http_json(cfd, 400, "Bad Request",
+					       "{\"error\":{\"message\":\"Invalid or missing prompt string\"}}\n");
+				close(cfd);
+				continue;
+			}
+		}
+
+		int n_prompt = tokenizer_encode(&tok, prompt_buf, 0, 0, enc_buf, 4096);
+		if (n_prompt <= 0) {
+			enc_buf[0] = (int)(a.hdr.bos_token_id ? a.hdr.bos_token_id : 1u);
+			n_prompt = 1;
+		}
+		if ((uint32_t)n_prompt >= a.hdr.seq_len) {
+			n_prompt = (int)a.hdr.seq_len - 1;
+		}
+		for (int i = 0; i < n_prompt; i++) {
+			pf_toks[i] = (uint32_t)enc_buf[i];
+		}
+
+		/* Prefix KV reuse: keep longest matching prefix (leaving >=1 token to produce logits) */
+		uint32_t lcp = 0u;
+		while (lcp < kv_hist_len && lcp + 1u < (uint32_t)n_prompt &&
+		       kv_hist[lcp] == pf_toks[lcp]) {
+			lcp++;
+		}
+		if (lcp == 0u) {
+			arena_clear_kv(&a);
+		}
+		uint32_t pf_start = lcp;
+		uint32_t pf_count = (uint32_t)n_prompt - pf_start;
+		int need_logits = (temp > 0.0f || rep_pen > 1.0f);
+		uint32_t argmax = 0u;
+		double pf_wall_us = 0.0;
+
+		if (arena_prefill_tokens(&a, pf_toks + pf_start, pf_count, pf_start,
+					 need_logits ? logits : NULL, &argmax,
+					 NULL, &pf_wall_us) != 0) {
+			send_http_json(cfd, 500, "Internal Server Error",
+				       "{\"error\":{\"message\":\"C7x prefill failed\"}}\n");
+			kv_hist_len = 0u;
+			close(cfd);
+			continue;
+		}
+		for (int i = 0; i < n_prompt; i++) {
+			kv_hist[i] = pf_toks[i];
+		}
+		kv_hist_len = (uint32_t)n_prompt;
+
+		uint32_t cur_pos = (uint32_t)n_prompt;
+		uint32_t nxt = need_logits
+			       ? sample_logits_with_penalty(logits, a.hdr.vocab_size, temp, topp,
+							    rep_pen, kv_hist, cur_pos)
+			       : argmax;
+		uint32_t prev_tok = pf_toks[n_prompt - 1];
+		uint32_t gen_n = 0u;
+		size_t out_len = 0u;
+		out_text[0] = '\0';
+		const char *finish_reason = "length";
+		char req_id[64];
+		long created_ts = (long)time(NULL);
+		snprintf(req_id, sizeof(req_id), "c7x-%ld-%" PRIu64, created_ts, ++req_counter);
+
+		if (stream) {
+			const char *sse_hdr =
+				"HTTP/1.1 200 OK\r\n"
+				"Content-Type: text/event-stream\r\n"
+				"Cache-Control: no-cache\r\n"
+				"Access-Control-Allow-Origin: *\r\n"
+				"Connection: close\r\n\r\n";
+			sock_send_all(cfd, sse_hdr, strlen(sse_hdr));
+		}
+
+		double t_gen0 = now_us();
+		while (gen_n < (uint32_t)max_tokens && cur_pos < a.hdr.seq_len) {
+			if (chat_is_stop(&cc, nxt)) {
+				finish_reason = "stop";
+				break;
+			}
+			const char *piece = tokenizer_decode(&tok, (int)prev_tok, (int)nxt);
+			if (stream) {
+				char esc_p[2048];
+				char chunk[3072];
+				json_escape_str(esc_p, sizeof(esc_p), piece);
+				int clen;
+				if (is_chat) {
+					clen = snprintf(chunk, sizeof(chunk),
+							"data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+							"\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+							"\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+							req_id, created_ts, model_name, esc_p);
+				} else {
+					clen = snprintf(chunk, sizeof(chunk),
+							"data: {\"id\":\"%s\",\"object\":\"text_completion\","
+							"\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+							"\"text\":\"%s\",\"finish_reason\":null}]}\n\n",
+							req_id, created_ts, model_name, esc_p);
+				}
+				if (sock_send_all(cfd, chunk, (size_t)clen) != 0) {
+					break;
+				}
+			} else {
+				size_t plen = strlen(piece);
+				if (out_len + plen + 1u < 131072u) {
+					memcpy(out_text + out_len, piece, plen);
+					out_len += plen;
+					out_text[out_len] = '\0';
+				}
+			}
+			gen_n++;
+			if (gen_n >= (uint32_t)max_tokens || cur_pos >= a.hdr.seq_len) {
+				break;
+			}
+			if (cur_pos < 4096u) {
+				kv_hist[cur_pos] = nxt;
+			}
+			uint32_t next_arg = 0u;
+			if (arena_forward_token(&a, nxt, cur_pos,
+						need_logits ? logits : NULL, &next_arg,
+						NULL, -1, 0u, NULL, NULL) != 0) {
+				break;
+			}
+			cur_pos++;
+			kv_hist_len = cur_pos < 4096u ? cur_pos : 4096u;
+			prev_tok = nxt;
+			nxt = need_logits
+			      ? sample_logits_with_penalty(logits, a.hdr.vocab_size, temp, topp,
+							   rep_pen, kv_hist, cur_pos)
+			      : next_arg;
+		}
+		double gen_s = (now_us() - t_gen0) / 1e6;
+		double gen_tps = (gen_n > 0u && gen_s > 0.0) ? ((double)gen_n / gen_s) : 0.0;
+		double pf_tps  = (pf_count > 0u && pf_wall_us > 0.0) ? ((double)pf_count / (pf_wall_us / 1e6)) : 0.0;
+
+		if (stream) {
+			char tail[512];
+			int tlen;
+			if (is_chat) {
+				tlen = snprintf(tail, sizeof(tail),
+						"data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+						"\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+						"\"delta\":{},\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+						req_id, created_ts, model_name, finish_reason);
+			} else {
+				tlen = snprintf(tail, sizeof(tail),
+						"data: {\"id\":\"%s\",\"object\":\"text_completion\","
+						"\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,"
+						"\"text\":\"\",\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+						req_id, created_ts, model_name, finish_reason);
+			}
+			sock_send_all(cfd, tail, (size_t)tlen);
+		} else {
+			json_escape_str(esc_buf, 262144u, out_text);
+			if (is_chat) {
+				snprintf(resp_buf, 300000u,
+					 "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,"
+					 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":"
+					 "{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"%s\"}],"
+					 "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%u,\"total_tokens\":%u},"
+					 "\"timings\":{\"prefill_tokens\":%u,\"cached_tokens\":%u,"
+					 "\"prefill_tok_per_s\":%.2f,\"decode_tok_per_s\":%.2f}}\n",
+					 req_id, created_ts, model_name, esc_buf, finish_reason,
+					 n_prompt, gen_n, (uint32_t)n_prompt + gen_n,
+					 pf_count, pf_start, pf_tps, gen_tps);
+			} else {
+				snprintf(resp_buf, 300000u,
+					 "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,"
+					 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"text\":\"%s\","
+					 "\"finish_reason\":\"%s\"}],"
+					 "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%u,\"total_tokens\":%u},"
+					 "\"timings\":{\"prefill_tokens\":%u,\"cached_tokens\":%u,"
+					 "\"prefill_tok_per_s\":%.2f,\"decode_tok_per_s\":%.2f}}\n",
+					 req_id, created_ts, model_name, esc_buf, finish_reason,
+					 n_prompt, gen_n, (uint32_t)n_prompt + gen_n,
+					 pf_count, pf_start, pf_tps, gen_tps);
+			}
+			send_http_json(cfd, 200, "OK", resp_buf);
+		}
+
+		printf("[serve] %s %s stream=%d | prompt=%d (cached=%u, prefill=%u @ %.1f tok/s) | gen=%u @ %.2f tok/s\n",
+		       method, path, stream, n_prompt, pf_start, pf_count, pf_tps, gen_n, gen_tps);
+		fflush(stdout);
+		close(cfd);
+	}
+
+	printf("\n[serve] shutting down.\n");
+	close(srv);
+	free(logits);
+	free(enc_buf);
+	free(pf_toks);
+	free(kv_hist);
+	free(req_buf);
+	free(prompt_buf);
+	free(out_text);
+	free(esc_buf);
+	free(resp_buf);
+	tokenizer_free(&tok);
+	arena_close(&a);
+	return 0;
+}
+
 int cmd_llama(int argc, char **argv)
 {
 	if (argc < 3) {
 		fprintf(stderr,
 			"usage:\n"
+			"  c7x-ai llama info   <model.c7m>\n"
 			"  c7x-ai llama verify <model.c7m> [tokenizer.bin] <golden.bin> [steps]\n"
 			"  c7x-ai llama run    <model.c7m> [tokenizer.bin] [-p prompt] [-n steps] [-t temp] [-P topp] [-s seed]\n"
+			"  c7x-ai llama chat   <model.c7m> [-t temp] [-P topp] [--rep-penalty f] [-n max_tokens] [--system msg]\n"
 			"  c7x-ai llama spec   <target.c7m> <draft.c7m> [-k draft_len] [-p prompt] [-n steps]\n");
 		return 2;
+	}
+	if (strcmp(argv[2], "info") == 0) {
+		return cmd_llama_info(argc, argv);
 	}
 	if (strcmp(argv[2], "verify") == 0) {
 		return cmd_llama_verify(argc, argv);
 	}
 	if (strcmp(argv[2], "run") == 0) {
 		return cmd_llama_run(argc, argv);
+	}
+	if (strcmp(argv[2], "chat") == 0) {
+		return cmd_llama_chat(argc, argv);
 	}
 	if (strcmp(argv[2], "spec") == 0) {
 		return cmd_llama_spec(argc, argv);

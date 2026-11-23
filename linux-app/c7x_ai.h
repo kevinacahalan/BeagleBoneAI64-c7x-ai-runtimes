@@ -30,5 +30,6 @@ int cmd_stop(int argc, char **argv);
 int cmd_trace(int argc, char **argv);
 int cmd_bench(int argc, char **argv);
 int cmd_llama(int argc, char **argv);
+int cmd_serve(int argc, char **argv);
 
 #endif /* LINUX_APP_C7X_AI_H_ */

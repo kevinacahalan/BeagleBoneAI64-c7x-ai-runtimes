@@ -78,7 +78,10 @@ static void usage(const char *prog)
 		"  trace [-f]               Dump or follow C7x remoteproc trace buffer\n"
 		"  bench [all|cbank|mem|dru|gemm|gemv]\n"
 		"                           Run C7x MMA/DRU/MSMC/DDR microbenchmarks & verify\n"
-		"  llama <verify|run> ...   Run or verify W8A8 transformer inference on C7x+MMA\n",
+		"  llama <info|verify|run|chat|spec> ...\n"
+		"                           Inspect, verify, run, chat, or speculatively decode on C7x+MMA\n"
+		"  serve <model.c7m> [--host 0.0.0.0] [--port 8080]\n"
+		"                           OpenAI-compatible HTTP/1.1 + SSE inference server\n",
 		prog, C7X_DEFAULT_FW);
 }
 
@@ -105,6 +108,9 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "llama") == 0) {
 		return cmd_llama(argc, argv);
+	}
+	if (strcmp(argv[1], "serve") == 0) {
+		return cmd_serve(argc, argv);
 	}
 	usage(argv[0]);
 	return 2;
