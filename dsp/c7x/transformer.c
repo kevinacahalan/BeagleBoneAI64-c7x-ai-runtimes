@@ -176,11 +176,12 @@ static int carve_scratch(const struct c7m_header *hdr, void *buf, uint32_t bytes
 	uint32_t att_b = align64_u32(hdr->seq_len * (uint32_t)sizeof(float));
 	uint32_t max_k = hdr->hidden_pad > hdr->dim_pad ? hdr->hidden_pad : hdr->dim_pad;
 	uint32_t xq_b  = align64_u32(max_k);
-	/* W4A8 wcls skips y_i32 staging completely, allowing 152k+ vocab inside 444 KiB L2! */
+	/* Full W4A8 models never use y_i32 staging, freeing extra L2 SRAM for DRU ping-pong! */
+	uint32_t need_y32 = !((hdr->flags & C7M_FLAG_W4A8_LAYERS) && (hdr->flags & C7M_FLAG_W4A8_WCLS));
 	uint32_t max_n = (hdr->flags & C7M_FLAG_W4A8_WCLS)
 			 ? max_k
 			 : (hdr->vocab_pad > max_k ? hdr->vocab_pad : max_k);
-	uint32_t y32_b = align64_u32(max_n * (uint32_t)sizeof(int32_t));
+	uint32_t y32_b = need_y32 ? align64_u32(max_n * (uint32_t)sizeof(int32_t)) : 0u;
 
 #define TAKE(field, type, sz)                             \
 	do {                                              \
@@ -659,15 +660,21 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 		biases = (const struct c7m_layer_bias_offs *)model_ptr(hdr, hdr->off_bias_table);
 	}
 
-	/* Choose maximum chunk size (up to 60 on silicon, 16 in host emulation) that fits prefill_buf. */
+	/*
+	 * Choose maximum prefill chunk size (up to 240 on silicon for W4A8 B-stationary
+	 * multi-block reuse, 60 for W8A8; 48/16 in host emulation) that fits prefill_buf.
+	 */
+	uint32_t mma_block_m;
 #ifdef __C7X_HOSTEM__
-	max_chunk = 16u;
+	mma_block_m = 16u;
+	max_chunk = w4_layers ? 48u : 16u;
 #else
-	max_chunk = 60u;
+	mma_block_m = 60u;
+	max_chunk = w4_layers ? 240u : 60u;
 #endif
 	{
 		size_t per_tok =
-			(size_t)dim * 3u * sizeof(float) +          /* X, XB, Q */
+			(size_t)dim * 2u * sizeof(float) +          /* X, Q */
 			(size_t)kv_dim * 2u * sizeof(float) +       /* K, V */
 			(size_t)hidden_dim * 2u * sizeof(float) +   /* HB, HB2 */
 			(size_t)max_k * sizeof(int8_t) +            /* XQ */
@@ -689,7 +696,7 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 		uint32_t cur_pos = start_pos + done;
 		uint8_t *bp = (uint8_t *)prefill_buf;
 		size_t boff = 0u;
-		float *X, *XB, *Q, *K, *V, *HB, *HB2, *XS;
+		float *X, *Q, *K, *V, *HB, *HB2, *XS;
 		int8_t *XQ;
 		int32_t *Y32 = NULL;
 		uint32_t t, l;
@@ -705,7 +712,6 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 		} while (0)
 
 		PTAKE(X,   float,  (size_t)m * dim * sizeof(float));
-		PTAKE(XB,  float,  (size_t)m * dim * sizeof(float));
 		PTAKE(Q,   float,  (size_t)m * dim * sizeof(float));
 		PTAKE(K,   float,  (size_t)m * kv_dim * sizeof(float));
 		PTAKE(V,   float,  (size_t)m * kv_dim * sizeof(float));
@@ -740,40 +746,33 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 
 			t_layer0 = read_tsc();
 
-			/* Attention RMSNorm + quantize all m rows */
+			/* L2-fused Attention RMSNorm -> l2s.xb -> Quant -> XQ (avoids DDR XB round-trip!) */
 			t0 = read_tsc();
 			for (t = 0u; t < m; t++) {
-				c7x_rmsnorm_f32(XB + (size_t)t * dim, X + (size_t)t * dim,
-						rms_att, dim, eps);
-			}
-			t1 = read_tsc();
-			if (prof) prof->cyc_rmsnorm += (t1 - t0);
-
-			t0 = read_tsc();
-			for (t = 0u; t < m; t++) {
-				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, XB + (size_t)t * dim,
+				c7x_rmsnorm_f32(l2s.xb, X + (size_t)t * dim, rms_att, dim, eps);
+				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, l2s.xb,
 						    dim, dim_pad, &XS[t]);
 			}
 			t1 = read_tsc();
-			if (prof) prof->cyc_quant += (t1 - t0);
+			if (prof) prof->cyc_rmsnorm += (t1 - t0);
 
 			/* Batched Q, K, V on MMA */
 			proj_linear_batched(Q, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wq_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wq_s),
-					    Y32, m, dim_pad, dim_pad, dim, max_chunk, 0, w4_layers, tiled,
+					    Y32, m, dim_pad, dim_pad, dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_qkv_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			proj_linear_batched(K, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wk_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wk_s),
-					    Y32, m, dim_pad, kv_dim_pad, kv_dim, max_chunk, 0, w4_layers, tiled,
+					    Y32, m, dim_pad, kv_dim_pad, kv_dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_qkv_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			proj_linear_batched(V, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wv_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wv_s),
-					    Y32, m, dim_pad, kv_dim_pad, kv_dim, max_chunk, 0, w4_layers, tiled,
+					    Y32, m, dim_pad, kv_dim_pad, kv_dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_qkv_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			/* Optional QKV biases + RoPE + KV cache populate */
@@ -801,85 +800,64 @@ int c7x_llama_prefill_tokens(const struct c7m_header *hdr,
 			t1 = read_tsc();
 			if (prof) prof->cyc_rope += (t1 - t0);
 
-			/* Causal MHA attention for each position in chunk */
+			/* Causal MHA attention -> L2 l2s.xb -> fused Quant -> XQ (zero DDR XB write/read!) */
 			t0 = read_tsc();
 			for (t = 0u; t < m; t++) {
-				c7x_attn_mha_f32(XB + (size_t)t * dim, Q + (size_t)t * dim,
+				c7x_attn_mha_f32(l2s.xb, Q + (size_t)t * dim,
 						 k_layer, v_layer, l2s.att, cur_pos + t,
 						 hdr->n_heads, hdr->n_kv_heads, hdr->head_size);
+				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, l2s.xb,
+						    dim, dim_pad, &XS[t]);
 			}
 			t1 = read_tsc();
 			if (prof) prof->cyc_attn += (t1 - t0);
 
-			/* Quantize XB + batched Wo + residual add */
-			t0 = read_tsc();
-			for (t = 0u; t < m; t++) {
-				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, XB + (size_t)t * dim,
-						    dim, dim_pad, &XS[t]);
-			}
-			t1 = read_tsc();
-			if (prof) prof->cyc_quant += (t1 - t0);
-
 			proj_linear_batched(X, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wo_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->wo_s),
-					    Y32, m, dim_pad, dim_pad, dim, max_chunk, 1, w4_layers, tiled,
+					    Y32, m, dim_pad, dim_pad, dim, mma_block_m, 1, w4_layers, tiled,
 					    prof ? &prof->cyc_wo_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
-			/* FFN RMSNorm + quantize */
+			/* L2-fused FFN RMSNorm -> l2s.xb -> Quant -> XQ */
 			t0 = read_tsc();
 			for (t = 0u; t < m; t++) {
-				c7x_rmsnorm_f32(XB + (size_t)t * dim, X + (size_t)t * dim,
-						rms_ffn, dim, eps);
-			}
-			t1 = read_tsc();
-			if (prof) prof->cyc_rmsnorm += (t1 - t0);
-
-			t0 = read_tsc();
-			for (t = 0u; t < m; t++) {
-				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, XB + (size_t)t * dim,
+				c7x_rmsnorm_f32(l2s.xb, X + (size_t)t * dim, rms_ffn, dim, eps);
+				c7x_quantize_f32_i8(XQ + (size_t)t * dim_pad, l2s.xb,
 						    dim, dim_pad, &XS[t]);
 			}
 			t1 = read_tsc();
-			if (prof) prof->cyc_quant += (t1 - t0);
+			if (prof) prof->cyc_rmsnorm += (t1 - t0);
 
 			/* Batched W1, W3 on MMA */
 			proj_linear_batched(HB, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->w1_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->w1_s),
-					    Y32, m, dim_pad, hidden_pad, hidden_dim, max_chunk, 0, w4_layers, tiled,
+					    Y32, m, dim_pad, hidden_pad, hidden_dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_ffn_up_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			proj_linear_batched(HB2, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->w3_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->w3_s),
-					    Y32, m, dim_pad, hidden_pad, hidden_dim, max_chunk, 0, w4_layers, tiled,
+					    Y32, m, dim_pad, hidden_pad, hidden_dim, mma_block_m, 0, w4_layers, tiled,
 					    prof ? &prof->cyc_ffn_up_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
-			/* SwiGLU + quantize HB */
+			/* L2-fused SwiGLU -> l2s.hb -> Quant -> XQ (avoids 100+ MiB DDR HB round-trip!) */
 			t0 = read_tsc();
 			for (t = 0u; t < m; t++) {
-				c7x_swiglu_f32(HB + (size_t)t * hidden_dim,
+				c7x_swiglu_f32(l2s.hb,
 					       HB + (size_t)t * hidden_dim,
 					       HB2 + (size_t)t * hidden_dim, hidden_dim);
-			}
-			t1 = read_tsc();
-			if (prof) prof->cyc_swiglu += (t1 - t0);
-
-			t0 = read_tsc();
-			for (t = 0u; t < m; t++) {
-				c7x_quantize_f32_i8(XQ + (size_t)t * hidden_pad,
-						    HB + (size_t)t * hidden_dim,
+				c7x_quantize_f32_i8(XQ + (size_t)t * hidden_pad, l2s.hb,
 						    hidden_dim, hidden_pad, &XS[t]);
 			}
 			t1 = read_tsc();
-			if (prof) prof->cyc_quant += (t1 - t0);
+			if (prof) prof->cyc_swiglu += (t1 - t0);
 
 			/* Batched W2 + residual add into X */
 			proj_linear_batched(X, XQ, XS,
 					    layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->w2_q),
 					    (const float *)layer_ptr(hdr, msmc_base, msmc_n_layers, l, lo->w2_s),
-					    Y32, m, hidden_pad, dim_pad, dim, max_chunk, 1, w4_layers, tiled,
+					    Y32, m, hidden_pad, dim_pad, dim, mma_block_m, 1, w4_layers, tiled,
 					    prof ? &prof->cyc_ffn_down_mma : NULL, prof ? &prof->cyc_dequant : NULL);
 
 			if (prof) {

@@ -848,16 +848,84 @@ static void mma_gemv_w4a8_g64_m1_chunk(float *out, const int8_t *a, float a_scal
 	}
 }
 
-/* Batched M > 1 MMA W4A8 group-64 GEMM (block_m up to 60 rows per C-bank!). */
+/*
+ * Branch-hoisted tile_acc[m_cur][64] -> out_blk[m_cur][out_dim] writer.
+ * Keeping this out-of-line prevents register spills in the MMA XFER loops.
+ */
+static void store_tile_acc_w4(float *out_blk, const float *tile_acc_buf,
+			      const float *a_scales_blk, uint32_t m_cur,
+			      uint32_t col0, uint32_t out_dim, int add)
+{
+	uint32_t r;
+
+	if (col0 + 64u <= out_dim) {
+		if (add) {
+			for (r = 0u; r < m_cur; r++) {
+				const float *src = tile_acc_buf + (r << 6);
+				float *dst = out_blk + (size_t)r * out_dim + col0;
+				float16 as_v = (float16)a_scales_blk[r];
+
+				*(__float16_ptr)(dst + 0u)  += *(__float16_ptr)(float *)(src + 0u)  * as_v;
+				*(__float16_ptr)(dst + 16u) += *(__float16_ptr)(float *)(src + 16u) * as_v;
+				*(__float16_ptr)(dst + 32u) += *(__float16_ptr)(float *)(src + 32u) * as_v;
+				*(__float16_ptr)(dst + 48u) += *(__float16_ptr)(float *)(src + 48u) * as_v;
+			}
+		} else {
+			for (r = 0u; r < m_cur; r++) {
+				const float *src = tile_acc_buf + (r << 6);
+				float *dst = out_blk + (size_t)r * out_dim + col0;
+				float16 as_v = (float16)a_scales_blk[r];
+
+				*(__float16_ptr)(dst + 0u)  = *(__float16_ptr)(float *)(src + 0u)  * as_v;
+				*(__float16_ptr)(dst + 16u) = *(__float16_ptr)(float *)(src + 16u) * as_v;
+				*(__float16_ptr)(dst + 32u) = *(__float16_ptr)(float *)(src + 32u) * as_v;
+				*(__float16_ptr)(dst + 48u) = *(__float16_ptr)(float *)(src + 48u) * as_v;
+			}
+		}
+	} else {
+		uint32_t rem = (out_dim > col0) ? (out_dim - col0) : 0u;
+		uint32_t i;
+
+		for (r = 0u; r < m_cur; r++) {
+			const float *src = tile_acc_buf + (r << 6);
+			float *dst = out_blk + (size_t)r * out_dim + col0;
+			float as = a_scales_blk[r];
+
+			if (add) {
+				for (i = 0u; i < rem; i++) {
+					dst[i] += src[i] * as;
+				}
+			} else {
+				for (i = 0u; i < rem; i++) {
+					dst[i] = src[i] * as;
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Batched M > 1 MMA W4A8 group-64 GEMM (block_m up to 60 rows per C-bank!).
+ *
+ * Optimizations:
+ *   - Branch-free software-pipelined W4 unpack + MMA loops (pairs + odd + rest)
+ *   - L2-SRAM-resident tile_acc buffer (passed in)
+ *   - SE0-streamed w_scales during drain (bypasses L1D -> safe for DRU L2 ping-pong!)
+ *   - Interleaved HWAXFER/HWARCV + FP32 FMA hiding XFER->RCV hardware latency
+ *   - Out-of-line branch-hoisted store_tile_acc_w4
+ */
 static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, const float *a_scales_blk,
 					   const uint8_t *w_packed, const float *w_scales,
+					   float *tile_acc_buf,
 					   uint32_t m_cur, uint32_t k_pad, uint32_t n_tiles,
 					   uint32_t col_base, uint32_t out_dim, int add)
 {
-	static float tile_acc[64][64] __attribute__((aligned(64)));
 	__HWA_CONFIG_REG cfg;
 	__HWA_OFFSET_REG off;
 	uint32_t k_tiles = k_pad >> 6;
+	uint32_t pairs = m_cur >> 1;
+	uint32_t has_odd = m_cur & 1u;
+	uint32_t v_rem_start = pairs + has_odd;
 	uint32_t nt, kt, v, r;
 
 	memset(&cfg, 0, sizeof(cfg));
@@ -909,37 +977,43 @@ static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, 
 		__HWAADV();
 	}
 
-	memset(tile_acc, 0, m_cur * 64u * sizeof(float));
-
 	for (nt = 0u; nt < n_tiles; nt++) {
 		for (kt = 0u; kt < k_tiles; kt++) {
 			int is_last = (nt == n_tiles - 1u) && (kt == k_tiles - 1u);
 
 			se_open_2d(0, a_blk + (kt << 6), MMA_TILE, m_cur, (int32_t)k_pad);
 			if (!is_last) {
-				uint32_t b_loaded = 0u;
-
-				for (v = 0u; v < 32u; v++) {
+				/* Branch-free pipelined overlap: 2 MMA ops + 2 B-loads per iter. */
+				for (v = 0u; v < pairs; v++) {
 					uchar64 b0, b1;
 
 					UNPACK_W4_PAIR_S8(__SE1ADV(uchar64), b0, b1);
-					if (b_loaded < m_cur) {
-						__HWALDAB(__SE0ADV(uchar64), b0);
-						__HWAOP(0);
-					} else {
-						__HWALDB(b0);
-					}
+					__HWALDAB(__SE0ADV(uchar64), b0);
+					__HWAOP(0);
 					__HWAADV();
-					b_loaded++;
+					__HWALDAB(__SE0ADV(uchar64), b1);
+					__HWAOP(0);
+					__HWAADV();
+				}
+				if (has_odd) {
+					uchar64 b0, b1;
 
-					if (b_loaded < m_cur) {
-						__HWALDAB(__SE0ADV(uchar64), b1);
-						__HWAOP(0);
-					} else {
-						__HWALDB(b1);
-					}
+					UNPACK_W4_PAIR_S8(__SE1ADV(uchar64), b0, b1);
+					__HWALDAB(__SE0ADV(uchar64), b0);
+					__HWAOP(0);
 					__HWAADV();
-					b_loaded++;
+					__HWALDB(b1);
+					__HWAADV();
+				}
+				/* Branch-free pipelined remaining B-loads. */
+				for (v = v_rem_start; v < 32u; v++) {
+					uchar64 b0, b1;
+
+					UNPACK_W4_PAIR_S8(__SE1ADV(uchar64), b0, b1);
+					__HWALDB(b0);
+					__HWAADV();
+					__HWALDB(b1);
+					__HWAADV();
 				}
 			} else {
 				for (r = 0u; r < m_cur; r++) {
@@ -954,40 +1028,73 @@ static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, 
 				uint32_t prev_nt = (kt == 0u) ? (nt - 1u) : nt;
 				uint32_t prev_kt = (kt == 0u) ? (k_tiles - 1u) : (kt - 1u);
 				const float *sc = w_scales + ((size_t)prev_nt * k_tiles + prev_kt) * 64u;
-				float16 s0 = *(__float16_ptr)(float *)(sc + 0u);
-				float16 s1 = *(__float16_ptr)(float *)(sc + 16u);
-				float16 s2 = *(__float16_ptr)(float *)(sc + 32u);
-				float16 s3 = *(__float16_ptr)(float *)(sc + 48u);
+				float16 s0, s1, s2, s3;
+
+				/* Stream scales via SE0 (bypasses L1D -> coherent with DRU L2 ping-pong). */
+				se_open_1d_32b_mma(0, sc, 64u);
+				s0 = __SE0ADV(float16);
+				s1 = __SE0ADV(float16);
+				s2 = __SE0ADV(float16);
+				s3 = __SE0ADV(float16);
+				__SE0_CLOSE();
 
 				__HWAFENCE_OPXFER();
 				for (r = 0u; r < 64u; r++) {
 					__HWAADV();
 				}
-				for (r = 0u; r < m_cur; r++) {
-					float *dst = tile_acc[r];
-					int16 y0, y1, y2, y3;
 
-					__HWAXFER(0); __HWAADV(); y0 = __as_int16(__HWARCV(0)); __HWAADV();
-					__HWAXFER(0); __HWAADV(); y1 = __as_int16(__HWARCV(0)); __HWAADV();
-					__HWAXFER(0); __HWAADV(); y2 = __as_int16(__HWARCV(0)); __HWAADV();
-					__HWAXFER(0); __HWAADV(); y3 = __as_int16(__HWARCV(0)); __HWAADV();
-					*(__float16_ptr)(dst + 0u)  += __int_to_float(y0) * s0;
-					*(__float16_ptr)(dst + 16u) += __int_to_float(y1) * s1;
-					*(__float16_ptr)(dst + 32u) += __int_to_float(y2) * s2;
-					*(__float16_ptr)(dst + 48u) += __int_to_float(y3) * s3;
+				if (prev_kt == 0u) {
+					for (r = 0u; r < m_cur; r++) {
+						float *dst = tile_acc_buf + (r << 6);
+						int16 y0, y1, y2, y3;
+						float16 v0, v1, v2;
+
+						__HWAXFER(0); __HWAADV();
+						y0 = __as_int16(__HWARCV(0)); __HWAADV();
+						__HWAXFER(0); __HWAADV();
+						v0 = __int_to_float(y0) * s0;
+						y1 = __as_int16(__HWARCV(0)); __HWAADV();
+						__HWAXFER(0); __HWAADV();
+						*(__float16_ptr)(dst + 0u) = v0;
+						v1 = __int_to_float(y1) * s1;
+						y2 = __as_int16(__HWARCV(0)); __HWAADV();
+						__HWAXFER(0); __HWAADV();
+						*(__float16_ptr)(dst + 16u) = v1;
+						v2 = __int_to_float(y2) * s2;
+						y3 = __as_int16(__HWARCV(0)); __HWAADV();
+						*(__float16_ptr)(dst + 32u) = v2;
+						*(__float16_ptr)(dst + 48u) = __int_to_float(y3) * s3;
+					}
+				} else {
+					for (r = 0u; r < m_cur; r++) {
+						float *dst = tile_acc_buf + (r << 6);
+						int16 y0, y1, y2, y3;
+						float16 d0, d1, d2, d3;
+
+						d0 = *(__float16_ptr)(dst + 0u);
+						__HWAXFER(0); __HWAADV();
+						d1 = *(__float16_ptr)(dst + 16u);
+						y0 = __as_int16(__HWARCV(0)); __HWAADV();
+						__HWAXFER(0); __HWAADV();
+						d0 += __int_to_float(y0) * s0;
+						d2 = *(__float16_ptr)(dst + 32u);
+						y1 = __as_int16(__HWARCV(0)); __HWAADV();
+						__HWAXFER(0); __HWAADV();
+						*(__float16_ptr)(dst + 0u) = d0;
+						d1 += __int_to_float(y1) * s1;
+						d3 = *(__float16_ptr)(dst + 48u);
+						y2 = __as_int16(__HWARCV(0)); __HWAADV();
+						__HWAXFER(0); __HWAADV();
+						*(__float16_ptr)(dst + 16u) = d1;
+						d2 += __int_to_float(y2) * s2;
+						y3 = __as_int16(__HWARCV(0)); __HWAADV();
+						*(__float16_ptr)(dst + 32u) = d2;
+						*(__float16_ptr)(dst + 48u) = d3 + __int_to_float(y3) * s3;
+					}
 				}
 				if (kt == 0u) {
-					for (r = 0u; r < m_cur; r++) {
-						float *src = tile_acc[r];
-						finalize_w4_tile64(out_blk + r * out_dim,
-								   *(__float16_ptr)(src + 0u),
-								   *(__float16_ptr)(src + 16u),
-								   *(__float16_ptr)(src + 32u),
-								   *(__float16_ptr)(src + 48u),
-								   a_scales_blk[r], col_base + (prev_nt << 6), out_dim, add,
-								   NULL, NULL, 0);
-					}
-					memset(tile_acc, 0, m_cur * 64u * sizeof(float));
+					store_tile_acc_w4(out_blk, tile_acc_buf, a_scales_blk, m_cur,
+							  col_base + (prev_nt << 6), out_dim, add);
 				}
 			}
 		}
@@ -996,35 +1103,70 @@ static void mma_gemm_w4a8_g64_mblock_chunk(float *out_blk, const int8_t *a_blk, 
 	/* Drain final tile (n_tiles - 1, k_tiles - 1). */
 	{
 		const float *sc = w_scales + ((size_t)(n_tiles - 1u) * k_tiles + (k_tiles - 1u)) * 64u;
-		float16 s0 = *(__float16_ptr)(float *)(sc + 0u);
-		float16 s1 = *(__float16_ptr)(float *)(sc + 16u);
-		float16 s2 = *(__float16_ptr)(float *)(sc + 32u);
-		float16 s3 = *(__float16_ptr)(float *)(sc + 48u);
+		float16 s0, s1, s2, s3;
+
+		se_open_1d_32b_mma(0, sc, 64u);
+		s0 = __SE0ADV(float16);
+		s1 = __SE0ADV(float16);
+		s2 = __SE0ADV(float16);
+		s3 = __SE0ADV(float16);
+		__SE0_CLOSE();
 
 		__HWAFENCE_OPXFER();
 		for (r = 0u; r < 64u; r++) {
 			__HWAADV();
 		}
-		for (r = 0u; r < m_cur; r++) {
-			float *dst = tile_acc[r];
-			int16 y0, y1, y2, y3;
+		if (k_tiles == 1u) {
+			for (r = 0u; r < m_cur; r++) {
+				float *dst = tile_acc_buf + (r << 6);
+				int16 y0, y1, y2, y3;
+				float16 v0, v1, v2;
 
-			__HWAXFER(0); __HWAADV(); y0 = __as_int16(__HWARCV(0)); __HWAADV();
-			__HWAXFER(0); __HWAADV(); y1 = __as_int16(__HWARCV(0)); __HWAADV();
-			__HWAXFER(0); __HWAADV(); y2 = __as_int16(__HWARCV(0)); __HWAADV();
-			__HWAXFER(0); __HWAADV(); y3 = __as_int16(__HWARCV(0)); __HWAADV();
-			*(__float16_ptr)(dst + 0u)  += __int_to_float(y0) * s0;
-			*(__float16_ptr)(dst + 16u) += __int_to_float(y1) * s1;
-			*(__float16_ptr)(dst + 32u) += __int_to_float(y2) * s2;
-			*(__float16_ptr)(dst + 48u) += __int_to_float(y3) * s3;
-			finalize_w4_tile64(out_blk + r * out_dim,
-					   *(__float16_ptr)(dst + 0u),
-					   *(__float16_ptr)(dst + 16u),
-					   *(__float16_ptr)(dst + 32u),
-					   *(__float16_ptr)(dst + 48u),
-					   a_scales_blk[r], col_base + ((n_tiles - 1u) << 6), out_dim, add,
-					   NULL, NULL, 0);
+				__HWAXFER(0); __HWAADV();
+				y0 = __as_int16(__HWARCV(0)); __HWAADV();
+				__HWAXFER(0); __HWAADV();
+				v0 = __int_to_float(y0) * s0;
+				y1 = __as_int16(__HWARCV(0)); __HWAADV();
+				__HWAXFER(0); __HWAADV();
+				*(__float16_ptr)(dst + 0u) = v0;
+				v1 = __int_to_float(y1) * s1;
+				y2 = __as_int16(__HWARCV(0)); __HWAADV();
+				__HWAXFER(0); __HWAADV();
+				*(__float16_ptr)(dst + 16u) = v1;
+				v2 = __int_to_float(y2) * s2;
+				y3 = __as_int16(__HWARCV(0)); __HWAADV();
+				*(__float16_ptr)(dst + 32u) = v2;
+				*(__float16_ptr)(dst + 48u) = __int_to_float(y3) * s3;
+			}
+		} else {
+			for (r = 0u; r < m_cur; r++) {
+				float *dst = tile_acc_buf + (r << 6);
+				int16 y0, y1, y2, y3;
+				float16 d0, d1, d2, d3;
+
+				d0 = *(__float16_ptr)(dst + 0u);
+				__HWAXFER(0); __HWAADV();
+				d1 = *(__float16_ptr)(dst + 16u);
+				y0 = __as_int16(__HWARCV(0)); __HWAADV();
+				__HWAXFER(0); __HWAADV();
+				d0 += __int_to_float(y0) * s0;
+				d2 = *(__float16_ptr)(dst + 32u);
+				y1 = __as_int16(__HWARCV(0)); __HWAADV();
+				__HWAXFER(0); __HWAADV();
+				*(__float16_ptr)(dst + 0u) = d0;
+				d1 += __int_to_float(y1) * s1;
+				d3 = *(__float16_ptr)(dst + 48u);
+				y2 = __as_int16(__HWARCV(0)); __HWAADV();
+				__HWAXFER(0); __HWAADV();
+				*(__float16_ptr)(dst + 16u) = d1;
+				d2 += __int_to_float(y2) * s2;
+				y3 = __as_int16(__HWARCV(0)); __HWAADV();
+				*(__float16_ptr)(dst + 32u) = d2;
+				*(__float16_ptr)(dst + 48u) = d3 + __int_to_float(y3) * s3;
+			}
 		}
+		store_tile_acc_w4(out_blk, tile_acc_buf, a_scales_blk, m_cur,
+				  col_base + ((n_tiles - 1u) << 6), out_dim, add);
 	}
 
 	__SE1_CLOSE();
@@ -1036,8 +1178,12 @@ void c7x_mma_gemm_w4a8_g64_f32(float *out, const int8_t *a, const float *a_scale
 			       uint32_t m, uint32_t k_pad, uint32_t n_pad, uint32_t out_dim,
 			       uint32_t block_m, int add, uint32_t *argmax_out)
 {
+	static float tile_acc_fallback[64u * 64u] __attribute__((aligned(64)));
 	uint32_t n_tiles = n_pad >> 6;
 	uint32_t k_tiles = k_pad >> 6;
+	float *tile_acc = tile_acc_fallback;
+	uint8_t *dru_base = g_dru_l2_buf;
+	uint32_t dru_bytes = g_dru_l2_bytes;
 	uint32_t m0;
 
 	if (m == 0u || k_pad == 0u || n_pad == 0u || (k_pad % 64u) != 0u || (n_pad % 64u) != 0u) {
@@ -1129,64 +1275,95 @@ void c7x_mma_gemm_w4a8_g64_f32(float *out, const int8_t *a, const float *a_scale
 		block_m = 60u;
 #endif
 	}
+
+	/* Place tile_acc (16 KiB) in L2 SRAM when available. */
+	if (dru_base != NULL && dru_bytes >= 16384u) {
+		tile_acc = (float *)dru_base;
+		dru_base += 16384u;
+		dru_bytes -= 16384u;
+	}
+
+#if !defined(__C7X_HOSTEM__) && !defined(_HOST_BUILD)
+	/*
+	 * B-stationary DRU0 L2-SRAM ping-pong for batched prefill (m > 1):
+	 *   Fetches each chunk of (w_packed, w_scales) from DDR into L2 SRAM ONCE,
+	 *   then reuses that L2-resident chunk across ALL m0 blocks (0, block_m, ...)!
+	 */
+	if (dru_base != NULL && c7x_dru_is_ok() &&
+	    (uintptr_t)w_packed >= 0xA8000000ull && n_tiles >= 2u) {
+		uint32_t tile_w = k_tiles * 2048u;
+		uint32_t tile_s = k_tiles * 256u;
+		uint64_t total_b = (uint64_t)n_tiles * (uint64_t)(tile_w + tile_s);
+		uint32_t half_b = (dru_bytes >> 1) & ~63u;
+		uint32_t chunk_nt = half_b / (tile_w + tile_s);
+
+		if (total_b >= 131072ull && chunk_nt >= 1u) {
+			uint8_t *slot_buf[2];
+			uint32_t nt0 = 0u, slot = 0u, cur_nt;
+
+			if (chunk_nt > 8u) {
+				chunk_nt = 8u;
+			}
+			slot_buf[0] = dru_base;
+			slot_buf[1] = dru_base + half_b;
+
+			cur_nt = 1u;
+			c7x_dru_submit_pair_bytes(
+				0u,
+				(uint64_t)(uintptr_t)slot_buf[0],
+				(uint64_t)(uintptr_t)w_packed,
+				cur_nt * tile_w,
+				(uint64_t)(uintptr_t)(slot_buf[0] + cur_nt * tile_w),
+				(uint64_t)(uintptr_t)w_scales,
+				cur_nt * tile_s);
+
+			while (nt0 < n_tiles) {
+				uint32_t next_nt0 = nt0 + cur_nt;
+				uint32_t next_cnt = 0u;
+				const uint8_t *lw = slot_buf[slot];
+				const float   *ls = (const float *)(slot_buf[slot] + cur_nt * tile_w);
+
+				c7x_dru_wait(0u);
+				if (next_nt0 < n_tiles) {
+					next_cnt = n_tiles - next_nt0;
+					if (next_cnt > chunk_nt) {
+						next_cnt = chunk_nt;
+					}
+					c7x_dru_submit_pair_bytes(
+						0u,
+						(uint64_t)(uintptr_t)slot_buf[slot ^ 1u],
+						(uint64_t)(uintptr_t)(w_packed + (size_t)next_nt0 * tile_w),
+						next_cnt * tile_w,
+						(uint64_t)(uintptr_t)(slot_buf[slot ^ 1u] + next_cnt * tile_w),
+						(uint64_t)(uintptr_t)(w_scales + (size_t)next_nt0 * k_tiles * 64u),
+						next_cnt * tile_s);
+				}
+				/* B-stationary inner loop: reuse L2 weight chunk across all M blocks! */
+				for (m0 = 0u; m0 < m; m0 += block_m) {
+					uint32_t m_cur = (m - m0 < block_m) ? (m - m0) : block_m;
+
+					mma_gemm_w4a8_g64_mblock_chunk(
+						out + (size_t)m0 * out_dim,
+						a + (size_t)m0 * k_pad,
+						a_scales + m0,
+						lw, ls, tile_acc, m_cur, k_pad, cur_nt,
+						nt0 << 6, out_dim, add);
+				}
+				nt0 = next_nt0;
+				cur_nt = next_cnt;
+				slot ^= 1u;
+			}
+			return;
+		}
+	}
+#endif
 	for (m0 = 0u; m0 < m; m0 += block_m) {
 		uint32_t m_cur = (m - m0 < block_m) ? (m - m0) : block_m;
 
-#if !defined(__C7X_HOSTEM__) && !defined(_HOST_BUILD)
-		if (g_dru_l2_buf != NULL && c7x_dru_is_ok() &&
-		    (uintptr_t)w_packed >= 0xA8000000ull && n_tiles >= 4u) {
-			uint32_t tile_w = k_tiles * 2048u;
-			uint64_t total_b = (uint64_t)n_tiles * (uint64_t)tile_w;
-			uint32_t half_b = (g_dru_l2_bytes >> 1) & ~63u;
-			uint32_t chunk_nt = half_b / tile_w;
-
-			if (total_b >= 1048576ull && chunk_nt >= 1u) {
-				uint8_t *slot_buf[2];
-				uint32_t nt0 = 0u, slot = 0u, cur_nt;
-
-				if (chunk_nt > 8u) {
-					chunk_nt = 8u;
-				}
-				slot_buf[0] = g_dru_l2_buf;
-				slot_buf[1] = g_dru_l2_buf + half_b;
-
-				cur_nt = 1u;
-				c7x_dru_submit_bytes(0u, (uint64_t)(uintptr_t)slot_buf[0],
-						     (uint64_t)(uintptr_t)w_packed,
-						     cur_nt * tile_w);
-
-				while (nt0 < n_tiles) {
-					uint32_t next_nt0 = nt0 + cur_nt;
-					uint32_t next_cnt = 0u;
-					const uint8_t *lw = slot_buf[slot];
-					const float   *ws_chunk = w_scales + (size_t)nt0 * k_tiles * 64u;
-
-					c7x_dru_wait(0u);
-					if (next_nt0 < n_tiles) {
-						next_cnt = n_tiles - next_nt0;
-						if (next_cnt > chunk_nt) {
-							next_cnt = chunk_nt;
-						}
-						c7x_dru_submit_bytes(
-							0u,
-							(uint64_t)(uintptr_t)slot_buf[slot ^ 1u],
-							(uint64_t)(uintptr_t)(w_packed + (size_t)next_nt0 * tile_w),
-							next_cnt * tile_w);
-					}
-					mma_gemm_w4a8_g64_mblock_chunk(
-						out + m0 * out_dim, a + m0 * k_pad, a_scales + m0,
-						lw, ws_chunk, m_cur, k_pad, cur_nt,
-						nt0 << 6, out_dim, add);
-					nt0 = next_nt0;
-					cur_nt = next_cnt;
-					slot ^= 1u;
-				}
-				continue;
-			}
-		}
-#endif
-		mma_gemm_w4a8_g64_mblock_chunk(out + m0 * out_dim, a + m0 * k_pad, a_scales + m0,
-					       w_packed, w_scales, m_cur, k_pad, n_tiles,
+		mma_gemm_w4a8_g64_mblock_chunk(out + (size_t)m0 * out_dim,
+					       a + (size_t)m0 * k_pad,
+					       a_scales + m0,
+					       w_packed, w_scales, tile_acc, m_cur, k_pad, n_tiles,
 					       0u, out_dim, add);
 	}
 }

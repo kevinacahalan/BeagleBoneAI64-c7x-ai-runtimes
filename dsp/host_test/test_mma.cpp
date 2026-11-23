@@ -357,15 +357,16 @@ int main(void)
 	fail |= test_w4a8(128u, 64u);
 	fail |= test_w4a8(256u, 128u);
 
-	/* Test tile-major group-64 W4A8 MMA kernel (M=1 decode & M=12 batched prefill). */
+	/* Test tile-major group-64 W4A8 MMA kernel (M=1, M=12, odd M=19 k_tiles=1, multi-block M=37). */
 	{
-		const uint32_t ms[3] = { 1u, 1u, 12u };
-		const uint32_t ks[3] = { 320u, 768u, 192u };
-		const uint32_t ns[3] = { 320u, 256u, 128u };
-		for (int tc = 0; tc < 3; tc++) {
+		const uint32_t ms[5] = { 1u, 1u, 12u, 19u, 37u };
+		const uint32_t ks[5] = { 320u, 768u, 192u, 64u, 192u };
+		const uint32_t ns[5] = { 320u, 256u, 128u, 128u, 192u };
+		const int adds[5]    = { 0, 1, 0, 1, 0 };
+		for (int tc = 0; tc < 5; tc++) {
 			uint32_t m = ms[tc], k = ks[tc], n = ns[tc], out_dim = n - 12u;
 			uint32_t kt = k / 64u, nt = n / 64u;
-			int add = (tc == 1) ? 1 : 0;
+			int add = adds[tc];
 			int8_t *a = (int8_t *)alloc_aligned64((size_t)m * k);
 			float *as = (float *)alloc_aligned64(m * sizeof(float));
 			uint8_t *wp = (uint8_t *)alloc_aligned64((size_t)nt * kt * 2048u);

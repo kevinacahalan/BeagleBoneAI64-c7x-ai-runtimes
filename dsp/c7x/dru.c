@@ -158,17 +158,32 @@ int c7x_dru_init(uint32_t ch, struct c7x_dru_info *info)
 	__memory_fence(0x1);
 
 	/*
-	 * Verify direct-TR submission: try CHATOMIC (0x80000) first, then CHCORE (0xA0000),
-	 * using DDR arena (0xAC000000) and our NC-L2 completion marker TR9.
+	 * Verify direct-TR submission: try CHATOMIC (0x80000) first (with retry for
+	 * cold-boot channel settle), then CHCORE (0xA0000), using DDR arena (0xAC000000).
 	 */
-	for (mode = 0; mode < 2; mode++) {
+	for (mode = 0; mode < 3; mode++) {
 		uint64_t src_pa = C7X_DDR_ARENA_BASE + C7X_DDR_ARENA_SIZE - 4096u;
 		uint64_t dst_pa = src_pa + 64u;
 		volatile uint32_t *s32 = (volatile uint32_t *)(uintptr_t)src_pa;
 		volatile uint32_t *d32 = (volatile uint32_t *)(uintptr_t)dst_pa;
 		int wrc;
 
-		g_dru_use_chcore = mode;
+		if (mode > 0) {
+			/* Re-reset and re-enable channel cleanly before retry. */
+			DRU_REG32(DRU_OFF_CHRT_CTL(ch)) = 0u;
+			__memory_fence(0x1);
+			DRU_REG64(DRU_OFF_CHNRT_CFG(ch)) = 0ull;
+			DRU_REG64(DRU_OFF_CHNRT_OES(ch)) = 0xFFFFull;
+			DRU_REG64(DRU_OFF_CHNRT_SCH(ch)) = 0ull;
+			__memory_fence(0x1);
+			DRU_REG32(DRU_OFF_CHRT_CTL(ch)) = DRU_CHRT_CTL_ENABLE;
+			__memory_fence(0x1);
+			g_dru_marker_seq[ch] = 0ull;
+			*(volatile uint64_t *)(uintptr_t)DRU_MARKER_SRC_PA(ch) = 0ull;
+			*(volatile uint64_t *)(uintptr_t)DRU_MARKER_DST_PA(ch) = 0ull;
+			__memory_fence(0x1);
+		}
+		g_dru_use_chcore = (mode == 2) ? 1 : 0;
 		s32[0] = 0xA55A1234u;
 		d32[0] = 0xDEADBEEFu;
 		ai64_l1d_wbinv_all();

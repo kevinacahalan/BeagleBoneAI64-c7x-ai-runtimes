@@ -298,6 +298,52 @@ static int run_dru_bw(volatile struct c7x_ctrl *ctrl, uint8_t *ddr)
 		return 1;
 	}
 	printf("  DRU DDR->L2->DDR 128 KiB integrity check: PASS\n");
+
+	/* Verify full 7.625 MiB MSMC SRAM bounds (low edge 0x70040000 & high edge 0x707C0000). */
+	{
+		uint64_t msmc_lo = C7X_MSMC_BASE;
+		uint64_t msmc_hi = C7X_MSMC_BASE + C7X_MSMC_SIZE - 128u * 1024u;
+
+		mmio_zero(ddr + 0x100000u, 128u * 1024u);
+		if (c7x_exec(ctrl, C7X_OP_DRU_COPY, 0, 1, 128u * 1024u, 0, 0,
+			     C7X_DDR_ARENA_BASE, msmc_lo, 0, NULL) ||
+		    c7x_exec(ctrl, C7X_OP_DRU_COPY, 0, 1, 128u * 1024u, 0, 0,
+			     msmc_lo, msmc_hi, 0, NULL) ||
+		    c7x_exec(ctrl, C7X_OP_DRU_COPY, 0, 1, 128u * 1024u, 0, 0,
+			     msmc_hi, C7X_DDR_ARENA_BASE + 0x100000u, 0, NULL)) {
+			fprintf(stderr, "  FAIL: MSMC 7.625 MiB full-span DRU copy failed!\n");
+			return 1;
+		}
+		if (memcmp(ddr, ddr + 0x100000u, 128u * 1024u) != 0) {
+			fprintf(stderr, "  FAIL: MSMC 7.625 MiB edge-to-edge data mismatch!\n");
+			return 1;
+		}
+		printf("  MSMC 7.625 MiB span (0x%08" PRIx64 "..0x%08" PRIx64 ") edge-to-edge check: PASS\n",
+		       msmc_lo, msmc_hi + 128u * 1024u);
+	}
+
+	/* Verify 1.5 GiB high-DDR arena (0x880000000) via SE0 + DRU0 when reserved in DT. */
+	if (access("/proc/device-tree/reserved-memory/c7x-llm-arena@880000000", F_OK) == 0) {
+		uint64_t hi_lo = C7X_LLM_HI_ARENA_BASE;
+		uint64_t hi_top = C7X_LLM_HI_ARENA_BASE + C7X_LLM_HI_ARENA_SIZE - 128u * 1024u;
+
+		mmio_zero(ddr + 0x100000u, 128u * 1024u);
+		if (c7x_exec(ctrl, C7X_OP_DRU_COPY, 0, 1, 128u * 1024u, 0, 0,
+			     C7X_DDR_ARENA_BASE, hi_lo, 0, NULL) ||
+		    c7x_exec(ctrl, C7X_OP_MEM_BW_COPY, 0, 1, 128u * 1024u, 0, 0,
+			     hi_lo, hi_top, 0, NULL) ||
+		    c7x_exec(ctrl, C7X_OP_DRU_COPY, 0, 1, 128u * 1024u, 0, 0,
+			     hi_top, C7X_DDR_ARENA_BASE + 0x100000u, 0, NULL)) {
+			fprintf(stderr, "  FAIL: High-DDR 1.5 GiB arena DRU/SE0 check failed!\n");
+			return 1;
+		}
+		if (memcmp(ddr, ddr + 0x100000u, 128u * 1024u) != 0) {
+			fprintf(stderr, "  FAIL: High-DDR 1.5 GiB arena data mismatch!\n");
+			return 1;
+		}
+		printf("  High-DDR 1.5 GiB arena (0x%" PRIx64 "..0x%" PRIx64 ") DRU+SE0 check: PASS\n",
+		       hi_lo, hi_top + 128u * 1024u);
+	}
 	return 0;
 }
 

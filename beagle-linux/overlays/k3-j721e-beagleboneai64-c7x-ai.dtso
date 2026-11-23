@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // BeagleBone AI-64 C7x AI runtime overlay: reserves contiguous DDR tensor
 // arenas (no-map) shared between Linux A72 and C7x DSP:
-//   - 0xac000000 (64 MiB)  : primary / microbenchmark arena
-//   - 0xc0000000 (512 MiB) : large LLM model + KV cache + prefill arena
+//   - 0xac000000  (64 MiB)  : primary / microbenchmark arena
+//   - 0x880000000 (1.5 GiB) : large LLM model + KV cache + prefill arena (high DDR bank)
 
 /dts-v1/;
 /plugin/;
@@ -22,8 +22,8 @@
 		no-map;
 	};
 
-	c7x_llm_arena: c7x-llm-arena@c0000000 {
-		reg = <0x00 0xc0000000 0x00 0x20000000>;
+	c7x_llm_arena: c7x-llm-arena@880000000 {
+		reg = <0x08 0x80000000 0x00 0x60000000>;
 		no-map;
 	};
 };

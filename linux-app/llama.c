@@ -518,8 +518,11 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 
 	memset(a, 0, sizeof(*a));
 
-	/* Prefer 512 MiB LLM arena (0xC0000000) when reserved in DT, else 64 MiB (0xAC000000). */
-	if (access("/proc/device-tree/reserved-memory/c7x-llm-arena@c0000000", F_OK) == 0) {
+	/* Prefer 1.5 GiB high-DDR arena (0x880000000), then 512 MiB (0xC0000000), else 64 MiB (0xAC000000). */
+	if (access("/proc/device-tree/reserved-memory/c7x-llm-arena@880000000", F_OK) == 0) {
+		a->arena_base = C7X_LLM_HI_ARENA_BASE;
+		a->arena_size = C7X_LLM_HI_ARENA_SIZE;
+	} else if (access("/proc/device-tree/reserved-memory/c7x-llm-arena@c0000000", F_OK) == 0) {
 		a->arena_base = C7X_LLM_ARENA_BASE;
 		a->arena_size = C7X_LLM_ARENA_SIZE;
 	} else {
@@ -556,20 +559,15 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 		return -1;
 	}
 
-	host_buf = malloc((size_t)fsz);
-	if (!host_buf || fread(host_buf, 1, (size_t)fsz, f) != (size_t)fsz) {
-		fprintf(stderr, "failed reading %s\n", model_path);
-		free(host_buf);
+	if (fread(&a->hdr, 1, sizeof(a->hdr), f) != sizeof(a->hdr)) {
+		fprintf(stderr, "failed reading header of %s\n", model_path);
 		fclose(f);
 		return -1;
 	}
-	fclose(f);
-
-	memcpy(&a->hdr, host_buf, sizeof(a->hdr));
 	if (a->hdr.magic != C7M_MAGIC || a->hdr.version != C7M_VERSION) {
 		fprintf(stderr, "invalid .c7m header magic=0x%08x ver=%u\n",
 			a->hdr.magic, a->hdr.version);
-		free(host_buf);
+		fclose(f);
 		return -1;
 	}
 
@@ -596,10 +594,12 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 	off += align64_sz(sizeof(struct c7x_llama_req));
 
 	a->off_tokens = off;
-	off += align64_sz(4096u); /* up to 1024 prompt token IDs */
+	off += align64_sz(4096u * sizeof(uint32_t)); /* up to 4096 prompt token IDs */
 
 	a->off_prefill_buf = off;
-	a->prefill_buf_bytes = 8u * 1024u * 1024u; /* up to 8 MiB batched prefill workspace */
+	a->prefill_buf_bytes = (a->arena_size >= 256u * 1024u * 1024u)
+			       ? (32u * 1024u * 1024u)
+			       : (8u * 1024u * 1024u);
 	if (off + a->prefill_buf_bytes > a->arena_size) {
 		a->prefill_buf_bytes = (a->arena_size > off)
 				       ? ((a->arena_size - off) & ~((size_t)63u))
@@ -612,7 +612,7 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 		fprintf(stderr, "model + KV cache (%.2f MiB) exceeds %.0f MiB DDR arena\n",
 			(double)a->total_used / (1024.0 * 1024.0),
 			(double)a->arena_size / (1024.0 * 1024.0));
-		free(host_buf);
+		fclose(f);
 		return -1;
 	}
 
@@ -621,17 +621,42 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 	    (size_t)a->hdr.off_tokenizer + a->hdr.tokenizer_size <= (size_t)fsz) {
 		a->embedded_tok = malloc(a->hdr.tokenizer_size);
 		if (a->embedded_tok) {
-			memcpy(a->embedded_tok, host_buf + a->hdr.off_tokenizer, a->hdr.tokenizer_size);
-			a->embedded_tok_size = a->hdr.tokenizer_size;
+			fseek(f, (long)a->hdr.off_tokenizer, SEEK_SET);
+			if (fread(a->embedded_tok, 1, a->hdr.tokenizer_size, f) == a->hdr.tokenizer_size) {
+				a->embedded_tok_size = a->hdr.tokenizer_size;
+			} else {
+				free(a->embedded_tok);
+				a->embedded_tok = NULL;
+			}
 		}
 	}
 
+	/* Stream .c7m in 4 MiB chunks into DDR arena (avoids 1 GiB+ host malloc!). */
 	double t0 = now_us();
-	mmio_write(a->ddr + a->off_model, host_buf, (size_t)fsz);
+	const size_t chunk_sz = 4u * 1024u * 1024u;
+	host_buf = malloc(chunk_sz);
+	if (!host_buf) {
+		fprintf(stderr, "OOM allocating load buffer\n");
+		fclose(f);
+		return -1;
+	}
+	fseek(f, 0, SEEK_SET);
+	for (size_t done_b = 0; done_b < (size_t)fsz; ) {
+		size_t want = (size_t)fsz - done_b;
+		if (want > chunk_sz) want = chunk_sz;
+		if (fread(host_buf, 1, want, f) != want) {
+			fprintf(stderr, "short read on %s\n", model_path);
+			free(host_buf);
+			fclose(f);
+			return -1;
+		}
+		mmio_write(a->ddr + a->off_model + done_b, host_buf, want);
+		done_b += want;
+	}
 	mmio_zero(a->ddr + a->off_k_cache, a->kv_bytes);
 	mmio_zero(a->ddr + a->off_v_cache, a->kv_bytes);
 
-	/* Stage as many leading decoder layers as fit into on-chip 4 MiB MSMC SRAM. */
+	/* Stage as many leading decoder layers as fit into on-chip 7.625 MiB MSMC SRAM. */
 	if (a->msmc && a->hdr.off_layers_base != 0u && a->hdr.layer_stride != 0u) {
 		uint32_t fit = C7X_MSMC_SIZE / a->hdr.layer_stride;
 		if (fit > a->hdr.n_layers) {
@@ -640,12 +665,22 @@ static int arena_load_model(struct llama_arena *a, const char *model_path)
 		if (fit > 0u) {
 			size_t copy_bytes = (size_t)fit * a->hdr.layer_stride;
 			if (a->hdr.off_layers_base + copy_bytes <= (size_t)fsz) {
-				mmio_write(a->msmc, host_buf + a->hdr.off_layers_base, copy_bytes);
+				fseek(f, (long)a->hdr.off_layers_base, SEEK_SET);
+				for (size_t done_b = 0; done_b < copy_bytes; ) {
+					size_t want = copy_bytes - done_b;
+					if (want > chunk_sz) want = chunk_sz;
+					if (fread(host_buf, 1, want, f) != want) {
+						break;
+					}
+					mmio_write(a->msmc + done_b, host_buf, want);
+					done_b += want;
+				}
 				a->msmc_n_layers = fit;
 			}
 		}
 	}
 	free(host_buf);
+	fclose(f);
 	{
 		const char *mode_str = "w8a8-row";
 		if ((a->hdr.flags & C7M_FLAG_W4A8_LAYERS) && (a->hdr.flags & C7M_FLAG_W4A8_WCLS)) {
@@ -739,7 +774,7 @@ static int arena_prefill_tokens(struct llama_arena *a, const uint32_t *tokens,
 {
 	struct c7x_llama_req req;
 
-	if (n_tokens == 0u || n_tokens > 1024u) {
+	if (n_tokens == 0u || n_tokens > 4096u) {
 		return -1;
 	}
 	mmio_write(a->ddr + a->off_tokens, tokens, (size_t)n_tokens * sizeof(uint32_t));
@@ -1571,10 +1606,15 @@ static int cmd_llama_run(int argc, char **argv)
 			arena_close(&a);
 			return 1;
 		}
-		fprintf(stderr, "\n[prefill] %d prompt tokens in %.2f ms (%.1f tok/s DSP, %.1f tok/s wall)\n",
+		fprintf(stderr, "\n[prefill] %d prompt tokens in %.2f ms (%.1f tok/s DSP, %.1f tok/s wall) [qkv=%.1f attn=%.1f wo=%.1f ffn13=%.1f swi=%.1f ffn2=%.1f cls=%.1f rms/q=%.1f]\n",
 			n_prompt, (double)prof.cyc_total / 1e6,
 			(double)n_prompt / ((double)prof.cyc_total / 1e9),
-			(double)n_prompt / (pf_wall_us / 1e6));
+			(double)n_prompt / (pf_wall_us / 1e6),
+			(double)prof.cyc_qkv_mma / 1e6, (double)prof.cyc_attn / 1e6,
+			(double)prof.cyc_wo_mma / 1e6, (double)prof.cyc_ffn_up_mma / 1e6,
+			(double)prof.cyc_swiglu / 1e6, (double)prof.cyc_ffn_down_mma / 1e6,
+			(double)prof.cyc_cls_mma / 1e6,
+			(double)(prof.cyc_rmsnorm + prof.cyc_quant) / 1e6);
 		uint32_t nxt = (temp > 0.0f)
 			       ? sample_topp(logits, a.hdr.vocab_size, temp, topp)
 			       : argmax;

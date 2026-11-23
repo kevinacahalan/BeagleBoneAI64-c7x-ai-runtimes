@@ -5,15 +5,16 @@
  * Cache sizes: L1D = 32 KiB cache, L2 = 64 KiB cache + 448 KiB SRAM.
  *
  * Identity-mapped regions (4 KiB granule, 48-bit VA):
- *   0x00000000  1 GiB   device       mailboxes, GTC, SoC peripherals
- *   0x40000000  1 GiB   device       compute cluster (incl. DRU @ 0x6d000000)
- *     0x64800000  4 KiB   normal NC    control block (struct c7x_ctrl)
- *     0x64801000  444 KiB normal WB    L2 SRAM scratchpad
- *     0x70200000  4 MiB   normal WB    on-chip MSMC SRAM arena (clear of ATF/DMSC)
- *   0xa8000000  2 MiB   normal NC    DMA pool, resource table & trace buffer
- *   0xa8200000  14 MiB  normal WB    C7x code, data, stack, MMU tables
- *   0xac000000  64 MiB  normal WB    shared DDR tensor arena
- *   0xc0000000  512 MiB normal WB    large LLM DDR arena
+ *   0x00000000   1 GiB     device       mailboxes, GTC, SoC peripherals
+ *   0x40000000   1 GiB     device       compute cluster (incl. DRU @ 0x6d000000)
+ *     0x64800000 4 KiB     normal NC    control block (struct c7x_ctrl)
+ *     0x64801000 444 KiB   normal WB    L2 SRAM scratchpad
+ *     0x70040000 7.625 MiB normal WB    on-chip MSMC SRAM (L3 edge pages; ATF & DMSC unmapped)
+ *   0xa8000000   2 MiB     normal NC    DMA pool, resource table & trace buffer
+ *   0xa8200000   14 MiB    normal WB    C7x code, data, stack, MMU tables
+ *   0xac000000   64 MiB    normal WB    shared DDR tensor arena
+ *   0xc0000000   512 MiB   normal WB    legacy large LLM DDR arena
+ *   0x880000000  1.5 GiB   normal WB    expanded high-DDR LLM arena
  */
 
 #include <stdint.h>
@@ -63,16 +64,22 @@ extern void ai64_set_l2cfg(uint64_t cfg);
 #define CARVEOUT_BASE 0xa8000000ull
 #define CARVEOUT_SIZE 0x01000000ull
 
+#define NUM_MMU_TABLES 10u
+
 #pragma DATA_SECTION(mmu_tables, ".ai64_mmu")
 #pragma DATA_ALIGN(mmu_tables, 4096)
-static uint64_t mmu_tables[6][512];
+static uint64_t mmu_tables[NUM_MMU_TABLES][512];
 
-#define L0      mmu_tables[0]
-#define L1      mmu_tables[1]
-#define L2_1G   mmu_tables[2] /* 0x40000000 .. 0x7FFFFFFF */
-#define L2_2G   mmu_tables[3] /* 0x80000000 .. 0xBFFFFFFF */
-#define L3_SRAM mmu_tables[4] /* 0x64800000 .. 0x649FFFFF */
-#define L2_3G   mmu_tables[5] /* 0xC0000000 .. 0xFFFFFFFF */
+#define L0         mmu_tables[0]
+#define L1         mmu_tables[1]
+#define L2_1G      mmu_tables[2] /* 0x40000000 .. 0x7FFFFFFF */
+#define L2_2G      mmu_tables[3] /* 0x80000000 .. 0xBFFFFFFF */
+#define L3_SRAM    mmu_tables[4] /* 0x64800000 .. 0x649FFFFF */
+#define L2_3G      mmu_tables[5] /* 0xC0000000 .. 0xFFFFFFFF */
+#define L3_MSMC_LO mmu_tables[6] /* 0x70000000 .. 0x701FFFFF (ATF + guard unmapped) */
+#define L3_MSMC_HI mmu_tables[7] /* 0x70600000 .. 0x707FFFFF (guard + DMSC unmapped) */
+#define L2_34G     mmu_tables[8] /* 0x880000000 .. 0x8BFFFFFFF (1 GiB high DDR) */
+#define L2_35G     mmu_tables[9] /* 0x8C0000000 .. 0x8FFFFFFFF (512 MiB high DDR) */
 
 static uint64_t leaf(uint64_t type, uint64_t addr, uint32_t attr)
 {
@@ -94,7 +101,7 @@ void c7x_mmu_init(void)
 	uint64_t addr;
 	uint32_t i;
 
-	for (i = 0; i < 6u * 512u; i++) {
+	for (i = 0; i < NUM_MMU_TABLES * 512u; i++) {
 		mmu_tables[i / 512u][i % 512u] = 0;
 	}
 
@@ -103,6 +110,8 @@ void c7x_mmu_init(void)
 	L1[1] = table(L2_1G);
 	L1[2] = table(L2_2G);
 	L1[3] = table(L2_3G);
+	L1[34] = table(L2_34G);
+	L1[35] = table(L2_35G);
 
 	/* 0x40000000..0x7FFFFFFF: device by default (covers DRU at 0x6d000000). */
 	for (i = 0; i < 512u; i++) {
@@ -116,9 +125,23 @@ void c7x_mmu_init(void)
 		L3_SRAM[i] = leaf(DESC_PAGE, C7X_L2_BASE + i * SZ_4K, ATTR_WB);
 	}
 
-	/* On-chip MSMC SRAM arena (0x70200000, 4 MiB, normal write-back). */
-	for (addr = C7X_MSMC_BASE; addr < C7X_MSMC_BASE + C7X_MSMC_SIZE; addr += SZ_2M) {
-		L2_1G[(addr - SZ_1G) / SZ_2M] = leaf(DESC_BLOCK, addr, ATTR_WB);
+	/*
+	 * On-chip MSMC SRAM arena (0x70040000..0x707DFFFF, 7.625 MiB, normal WB):
+	 *   0x70000000..0x7003FFFF (pages 0..63 of L3_MSMC_LO): UNMAPPED (ATF + 128K guard)
+	 *   0x70040000..0x701FFFFF (pages 64..511 of L3_MSMC_LO): 1,792 KiB WB
+	 *   0x70200000..0x705FFFFF (2 x 2 MiB blocks): 4,096 KiB WB
+	 *   0x70600000..0x707DFFFF (pages 0..479 of L3_MSMC_HI): 1,920 KiB WB
+	 *   0x707E0000..0x707FFFFF (pages 480..511 of L3_MSMC_HI): UNMAPPED (64K guard + DMSC)
+	 */
+	L2_1G[(0x70000000ull - SZ_1G) / SZ_2M] = table(L3_MSMC_LO);
+	for (i = 64u; i < 512u; i++) {
+		L3_MSMC_LO[i] = leaf(DESC_PAGE, 0x70000000ull + (uint64_t)i * SZ_4K, ATTR_WB);
+	}
+	L2_1G[(0x70200000ull - SZ_1G) / SZ_2M] = leaf(DESC_BLOCK, 0x70200000ull, ATTR_WB);
+	L2_1G[(0x70400000ull - SZ_1G) / SZ_2M] = leaf(DESC_BLOCK, 0x70400000ull, ATTR_WB);
+	L2_1G[(0x70600000ull - SZ_1G) / SZ_2M] = table(L3_MSMC_HI);
+	for (i = 0u; i < 480u; i++) {
+		L3_MSMC_HI[i] = leaf(DESC_PAGE, 0x70600000ull + (uint64_t)i * SZ_4K, ATTR_WB);
 	}
 
 	/* C7x DDR carveout: 2 MiB NC (DMA pool + trace/rsc_table), 14 MiB WB (code/data). */
@@ -132,9 +155,17 @@ void c7x_mmu_init(void)
 		L2_2G[(addr - 2u * SZ_1G) / SZ_2M] = leaf(DESC_BLOCK, addr, ATTR_WB);
 	}
 
-	/* Large LLM DDR tensor arena (0xc0000000, 512 MiB, normal write-back). */
+	/* Legacy LLM DDR tensor arena (0xc0000000, 512 MiB, normal write-back). */
 	for (addr = C7X_LLM_ARENA_BASE; addr < C7X_LLM_ARENA_BASE + C7X_LLM_ARENA_SIZE; addr += SZ_2M) {
 		L2_3G[(addr - 3u * SZ_1G) / SZ_2M] = leaf(DESC_BLOCK, addr, ATTR_WB);
+	}
+
+	/* Expanded high-DDR LLM tensor arena (0x880000000, 1.5 GiB, normal write-back). */
+	for (i = 0u; i < 512u; i++) {
+		L2_34G[i] = leaf(DESC_BLOCK, 34ull * SZ_1G + (uint64_t)i * SZ_2M, ATTR_WB);
+	}
+	for (i = 0u; i < 256u; i++) {
+		L2_35G[i] = leaf(DESC_BLOCK, 35ull * SZ_1G + (uint64_t)i * SZ_2M, ATTR_WB);
 	}
 
 	ai64_set_mair(MAIR_VALUE);

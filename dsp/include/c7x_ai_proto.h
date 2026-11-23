@@ -17,15 +17,24 @@
 #define C7X_L2_SCRATCH_ADDR  0x64801000ull /* 444 KiB write-back scratchpad */
 #define C7X_L2_SCRATCH_SIZE  0x0006F000u
 
-/* On-chip MSMC SRAM (8 MiB total on TDA4VM; ATF at bottom 128 KiB, DMSC at top 64 KiB). */
-#define C7X_MSMC_BASE        0x70200000ull /* 4 MiB cleanly 2 MiB-aligned arena */
-#define C7X_MSMC_SIZE        0x00400000u
+/*
+ * On-chip MSMC SRAM (8 MiB total on TDA4VM):
+ *   0x70000000..0x7001FFFF (128 KiB): ARM Trusted Firmware (ATF) — untouchable
+ *   0x70020000..0x7003FFFF (128 KiB): unmapped safety guard band
+ *   0x70040000..0x707DFFFF (7.625 MiB): C7x MSMC SRAM arena (4 KiB L3 pages at edges)
+ *   0x707E0000..0x707EFFFF (64 KiB):  unmapped safety guard band
+ *   0x707F0000..0x707FFFFF (64 KiB):  DMSC IPC — untouchable
+ */
+#define C7X_MSMC_BASE          0x70040000ull
+#define C7X_MSMC_SIZE          0x007A0000u /* 7,808 KiB = 7.625 MiB */
 
 /* Shared reserved DDR tensor arenas (no-map in device tree). */
-#define C7X_DDR_ARENA_BASE   0xAC000000ull /* 64 MiB primary/benchmark arena */
-#define C7X_DDR_ARENA_SIZE   0x04000000u
-#define C7X_LLM_ARENA_BASE   0xC0000000ull /* 512 MiB large LLM arena (optional DT node) */
-#define C7X_LLM_ARENA_SIZE   0x20000000u
+#define C7X_DDR_ARENA_BASE     0xAC000000ull /* 64 MiB primary/benchmark arena */
+#define C7X_DDR_ARENA_SIZE     0x04000000u
+#define C7X_LLM_ARENA_BASE     0xC0000000ull /* Legacy 512 MiB LLM arena (optional DT node) */
+#define C7X_LLM_ARENA_SIZE     0x20000000u
+#define C7X_LLM_HI_ARENA_BASE  0x880000000ull /* 1.5 GiB high-DDR LLM arena (optional DT node) */
+#define C7X_LLM_HI_ARENA_SIZE  0x60000000u
 
 /* Compute cluster 0 DRU (Data Routing Unit) MMIO base. */
 #define C7X_DRU_BASE         0x6D000000ull

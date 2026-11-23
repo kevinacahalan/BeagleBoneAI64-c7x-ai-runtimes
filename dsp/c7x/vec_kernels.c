@@ -152,14 +152,19 @@ void c7x_rmsnorm_f32(float *out, const float *x, const float *weight,
 		     uint32_t n, float eps)
 {
 	float16 ss_v = (float16)0.0f;
+	uint32_t n_vec = n & ~15u;
 	uint32_t i = 0u;
 	float ss, inv;
 	float16 inv_v;
 
-	for (; i + 16u <= n; i += 16u) {
-		float16 xv = *(__float16_ptr)(float *)&x[i];
+	if (n_vec > 0u) {
+		se_open_1d_32b(0, x, n_vec);
+		for (; i < n_vec; i += 16u) {
+			float16 xv = __SE0ADV(float16);
 
-		ss_v += xv * xv;
+			ss_v += xv * xv;
+		}
+		__SE0_CLOSE();
 	}
 	ss = hsum_float16(ss_v);
 	for (; i < n; i++) {
@@ -170,11 +175,17 @@ void c7x_rmsnorm_f32(float *out, const float *x, const float *weight,
 	inv_v = (float16)inv;
 
 	i = 0u;
-	for (; i + 16u <= n; i += 16u) {
-		float16 xv = *(__float16_ptr)(float *)&x[i];
-		float16 wv = *(__float16_ptr)(float *)&weight[i];
+	if (n_vec > 0u) {
+		se_open_1d_32b(0, x, n_vec);
+		se_open_1d_32b(1, weight, n_vec);
+		for (; i < n_vec; i += 16u) {
+			float16 xv = __SE0ADV(float16);
+			float16 wv = __SE1ADV(float16);
 
-		*(__float16_ptr)&out[i] = (xv * inv_v) * wv;
+			*(__float16_ptr)&out[i] = (xv * inv_v) * wv;
+		}
+		__SE0_CLOSE();
+		__SE1_CLOSE();
 	}
 	for (; i < n; i++) {
 		out[i] = (x[i] * inv) * weight[i];
@@ -185,13 +196,18 @@ void c7x_quantize_f32_i8(int8_t *out_q, const float *x,
 			 uint32_t n, uint32_t n_pad, float *scale_out)
 {
 	float16 vmax = (float16)0.0f;
+	uint32_t n_vec = n & ~15u;
 	uint32_t i = 0u;
 	float max_abs, scale, inv;
 
-	for (; i + 16u <= n; i += 16u) {
-		float16 xv = __abs(*(__float16_ptr)(float *)&x[i]);
+	if (n_vec > 0u) {
+		se_open_1d_32b(0, x, n_vec);
+		for (; i < n_vec; i += 16u) {
+			float16 xv = __abs(__SE0ADV(float16));
 
-		vmax = __max(vmax, xv);
+			vmax = __max(vmax, xv);
+		}
+		__SE0_CLOSE();
 	}
 	max_abs = hmax_float16(vmax);
 	for (; i < n; i++) {
@@ -217,17 +233,21 @@ void c7x_quantize_f32_i8(int8_t *out_q, const float *x,
 		float16 hi_v = (float16)(127.0f);
 
 		i = 0u;
-		for (; i + 16u <= n; i += 16u) {
-			float16 xv = *(__float16_ptr)(float *)&x[i];
-			float16 sv = __min(__max(xv * inv_v, lo_v), hi_v);
-			int16 qv = __float_to_int(sv);
-			int32_t tmp[16] __attribute__((aligned(64)));
-			uint32_t k;
+		if (n_vec > 0u) {
+			se_open_1d_32b(0, x, n_vec);
+			for (; i < n_vec; i += 16u) {
+				float16 xv = __SE0ADV(float16);
+				float16 sv = __min(__max(xv * inv_v, lo_v), hi_v);
+				int16 qv = __float_to_int(sv);
+				int32_t tmp[16] __attribute__((aligned(64)));
+				uint32_t k;
 
-			*(__int16_ptr)tmp = qv;
-			for (k = 0u; k < 16u; k++) {
-				out_q[i + k] = (int8_t)tmp[k];
+				*(__int16_ptr)tmp = qv;
+				for (k = 0u; k < 16u; k++) {
+					out_q[i + k] = (int8_t)tmp[k];
+				}
 			}
+			__SE0_CLOSE();
 		}
 		for (; i < n; i++) {
 			float s = x[i] * inv;
@@ -532,15 +552,22 @@ void c7x_softmax_f32(float *x, uint32_t n)
 void c7x_swiglu_f32(float *out, const float *hb, const float *hb2, uint32_t n)
 {
 	const float16 one = (float16)1.0f;
+	uint32_t n_vec = n & ~15u;
 	uint32_t i = 0u;
 
-	for (; i + 16u <= n; i += 16u) {
-		float16 v  = *(__float16_ptr)(float *)&hb[i];
-		float16 v2 = *(__float16_ptr)(float *)&hb2[i];
-		float16 denom = one + vexpf_f16(-v);
-		float16 silu  = v * vrecip_f16(denom);
+	if (n_vec > 0u) {
+		se_open_1d_32b(0, hb, n_vec);
+		se_open_1d_32b(1, hb2, n_vec);
+		for (; i < n_vec; i += 16u) {
+			float16 v  = __SE0ADV(float16);
+			float16 v2 = __SE1ADV(float16);
+			float16 denom = one + vexpf_f16(-v);
+			float16 silu  = v * vrecip_f16(denom);
 
-		*(__float16_ptr)&out[i] = silu * v2;
+			*(__float16_ptr)&out[i] = silu * v2;
+		}
+		__SE0_CLOSE();
+		__SE1_CLOSE();
 	}
 	for (; i < n; i++) {
 		float v = hb[i];
