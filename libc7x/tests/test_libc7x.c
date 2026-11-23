@@ -141,8 +141,10 @@ static int test_q4_0_and_q8_0_cmdbuf(c7x_ctx_t *ctx)
 			for (j = 0; j < 16u; j++) {
 				int q0 = (int)lrintf(src[j] * id4) + 8;
 				int q1 = (int)lrintf(src[j + 16u] * id4) + 8;
-				if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-				if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+				if (q0 < 0) q0 = 0;
+				if (q0 > 15) q0 = 15;
+				if (q1 < 0) q1 = 0;
+				if (q1 > 15) q1 = 15;
 				b4[2u + j] = (uint8_t)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
 			}
 
@@ -153,7 +155,8 @@ static int test_q4_0_and_q8_0_cmdbuf(c7x_ctx_t *ctx)
 			b8[1] = (uint8_t)(d8h >> 8);
 			for (j = 0; j < 32u; j++) {
 				int q = (int)lrintf(src[j] * id8);
-				if (q < -127) q = -127; if (q > 127) q = 127;
+				if (q < -127) q = -127;
+				if (q > 127) q = 127;
 				((int8_t *)(b8 + 2u))[j] = (int8_t)q;
 			}
 		}
@@ -229,7 +232,7 @@ int main(void)
 	int fail = 0;
 
 	memset(&opts, 0, sizeof(opts));
-	opts.transport = C7X_TRANSPORT_HOSTEMU;
+	opts.transport = C7X_TRANSPORT_AUTO;
 	opts.emu_ddr_bytes = 32u * 1024u * 1024u;
 
 	ctx = c7x_open(&opts);
@@ -242,12 +245,12 @@ int main(void)
 		c7x_close(ctx);
 		return 1;
 	}
-	printf("[libc7x] hostemu ping: %.1f us\n", ping_us);
+	printf("[libc7x] ping: %.1f us\n", ping_us);
 
 	fail |= test_allocator(ctx);
 	fail |= test_q4_0_and_q8_0_cmdbuf(ctx);
 
 	c7x_close(ctx);
-	printf("\n=== libc7x Host Emulation Suite: %s ===\n", fail ? "FAIL" : "ALL PASSED");
+	printf("\n=== libc7x Suite: %s ===\n", fail ? "FAIL" : "ALL PASSED");
 	return fail;
 }

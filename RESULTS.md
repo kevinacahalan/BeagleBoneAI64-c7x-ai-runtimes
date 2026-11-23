@@ -251,3 +251,39 @@ Measured on the **exact same live BeagleBone AI-64 board** (dual Cortex-A72 @ 2.
 | **`Qwen2.5-1.5B`** | `1.96 tok/s` | `1.94 tok/s` | `3.81 tok/s` | `3.75 tok/s` | **`11.62 tok/s`** *(11.3)* | **`5.9×` / `6.0×`** | **`3.1×` / `3.1×`** |
 
 *Key takeaway:* Even against **both Cortex-A72 CPU cores saturated at 100%** running hand-tuned ARMv8 NEON `llama.cpp`, the bare-metal 1.0 GHz C7x + MMA runtime delivers **`5.8× – 13.8×` faster prompt prefill** (`11.3× – 27.4×` vs 1 core) and **`3.0× – 3.8×` faster token decode** (`5.6× – 6.7×` vs 1 core) — while leaving both A72 cores nearly idle for Linux, networking, and OpenAI SSE serving (`c7x-ai serve`).
+
+---
+
+## Milestone 7: Out-of-Tree `llama.cpp` Dynamic Backend (`libggml-c7x.so`) & `libc7x` Command-Buffer Runtime
+
+Built an out-of-tree, zero-fork dynamic GGML backend plugin (`ggml-c7x/libggml-c7x.so`, loaded at runtime via `GGML_BACKEND_PATH` into unmodified `GGML_BACKEND_DL=ON` `llama.cpp`) over the new reusable `libc7x` runtime and `C7X_OP_EXEC_LIST` flat command-buffer executor. Runs real `Q4_0`, `Q4_1`, `Q5_0`, `Q5_K`, `Q6_K`, `Q8_0`, `Q4_K_M`, `F16`, and `F32` GGUFs directly on the C7x + MMA with a single `EXEC_LIST` RPC per forward pass (`graph splits = 2`, 100% transformer layers + LM head offloaded).
+
+### 1. Live BeagleBone AI-64 Correctness Verification
+
+| Suite | Result | Details |
+| --- | --- | --- |
+| `libc7x` hardware unit suite (`test_libc7x`) | **PASS** | `ping = 2.5 µs`, coalescing DDR/MSMC allocator, `Q4_0→W4A8(MSMC) cos=0.99746`, `Q8_0→W8A8(DDR) cos=0.999979` |
+| `ggml-c7x` integration suite (`test_ggml_c7x_aarch64`) | **PASS** | Weight round-trip (`cos=0.999995`), partial `set_tensor`, tied `GET_ROWS+MUL_MAT`, OOB/dtype gating, 4,200-op auto-flush, 3D-`src1` MMA `Q4_0`/`Q4_K`/`Q8_0` (default & `GGML_C7X_W8A8=1`) |
+| `llama.cpp` `test-backend-ops` (`SET_ROWS\|SOFT_MAX\|ROPE\|CPY\|CONT`) | **915 / 915 PASS** | Identical 915/915 on both live silicon and x86_64 hostemu |
+| `llama.cpp` `test-backend-ops` (`MUL_MAT` `f16`/`f32`, batched/GQA/permuted) | **113 / 113 PASS** | Live silicon (`585/586` on hostemu; sole skip is 269 MiB > 256 MiB hostemu arena) |
+| `c7x-ai bench gemv` stability (post-DDR drain barrier) | **10 / 10 PASS** | Zero intermittent stale-line mismatches across 10 consecutive runs |
+
+### 2. Unmodified `llama.cpp` Head-to-Head (`llama-bench -fa 0 -t 2`, Live Silicon)
+
+Comparing unmodified `llama-bench` on the exact same BeagleBone AI-64 with `-ngl 0 -t 2` (2-core Cortex-A72 NEON CPU) vs `-ngl 99` (`GGML_BACKEND_PATH=libggml-c7x.so`, default `W4A8-g64` and optional `GGML_C7X_W8A8=1`):
+
+| Model (GGUF) | Size | 2T A72 `pp64` / `pp128` | **C7X0 `pp64` / `pp128`** *(W8A8)* | Prefill Speedup (`pp128`) | 2T A72 `tg32` | **C7X0 `tg32`** *(W8A8)* | Decode Speedup (`tg32`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`SmolLM2-135M` `Q4_0`** | `85.9 MiB` | `46.42` / `46.19 t/s` | **`165.08` / `175.07 t/s`** *(159.3 / 166.5)* | **`3.79×`** | `28.62 t/s` | **`47.71 t/s`** *(38.13)* | **`1.67×`** |
+| **`Qwen2.5-0.5B` `Q4_K_M`** | `463.0 MiB` | `13.95` / `13.98 t/s` | **`110.21` / `118.33 t/s`** *(110.6 / **119.14**)* | **`8.46×`** *(8.52×)* | `8.60 t/s` | **`14.31 t/s`** *(13.87)* | **`1.66×`** |
+| **`Qwen3-0.6B` `Q4_K_M`** (`hd=128`) | `372.7 MiB` | `12.62` / `12.65 t/s` | **`63.62` / `68.10 t/s`** *(61.8 / 65.3)* | **`5.38×`** | `7.75 t/s` | **`13.05 t/s`** *(10.68)* | **`1.68×`** |
+| **`Qwen2.5-1.5B` `Q4_0`** (`hd=128`) | `1011.2 MiB` | `3.69` / `4.94 t/s` | **`55.75` / `63.02 t/s`** | **`12.76×`** | `3.56 t/s` | **`8.25 t/s`** | **`2.32×`** |
+
+### 3. Accuracy Tradeoff: Default `W4A8-g64` vs. `GGML_C7X_W8A8=1` (`llama-perplexity`, `c=256`, 3 chunks)
+
+| Model | Cortex-A72 CPU Reference | C7X0 Default (`W4A8-g64`) | C7X0 `GGML_C7X_W8A8=1` | Notes |
+| --- | ---: | ---: | ---: | --- |
+| **`SmolLM2-135M` `Q4_0`** | `100.98 ± 20.05` | `131.58 ± 25.39` (`+30.3%`) | **`104.20 ± 20.76` (`+3.2%`)** | `W4A8-g64` merges 2 Q4_0 group-32 blocks into symmetric g64; `W8A8` preserves full block scales |
+| **`Qwen2.5-0.5B` `Q4_K_M`** | `66.41 ± 12.62` (`66.8 s`) | `75.98 ± 14.63` (`28.4 s`, `+14.4%`) | **`70.36 ± 13.42` (`+5.9%`)** | `W8A8=1` matches `W4A8` prefill speed (`119.14 t/s`) while slashing PPL delta by `2.4×` |
+
+*Key optimizations behind the **58× speedup** from initial `ggml-c7x` bring-up (`2.99 → 175.07 t/s` on `SmolLM2-135M pp128`):* eliminating mid-graph CPU splits via `Q4_1`/`Q5_0`/`Q5_K`/`Q6_K` repacking, L2-SRAM-staged GQA attention (`stage_src0_to_l2` 2D `SE0` F16→F32 + unbranched `k_v=1,2,4,8` `SE0` streaming), 16-wide branchless Cody-Waite RoPE, contiguous-`dst` row-`memcpy` `CONT` (`15×` speedup), and 16-wide vectorized `SET_ROWS` for `llama.cpp`'s flattened transposed V-cache writes.

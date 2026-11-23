@@ -186,6 +186,8 @@ int c7x_dru_init(uint32_t ch, struct c7x_dru_info *info)
 		g_dru_use_chcore = (mode == 2) ? 1 : 0;
 		s32[0] = 0xA55A1234u;
 		d32[0] = 0xDEADBEEFu;
+		__memory_fence(0x1);
+		__memory_fence(0x1);
 		ai64_l1d_wbinv_all();
 		__memory_fence(0x1);
 		__memory_fence(0x1);

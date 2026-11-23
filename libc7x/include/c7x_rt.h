@@ -109,6 +109,9 @@ void c7x_pack_f32_to_w4a8_g64(const float *w_f32, uint32_t n, uint32_t k,
 void c7x_pack_f32_ntile_to_w4a8_g64(const float *rows_f32, uint32_t valid_rows,
 				    uint32_t k, uint32_t nt,
 				    uint8_t *w_packed, float *w_scales);
+void c7x_pack_f32_ntile_to_w8a8(const float *rows_f32, uint32_t valid_rows,
+				uint32_t k, uint32_t nt,
+				int8_t *w_tiled, float *w_scales);
 void c7x_pack_f32_to_w8a8(const float *w_f32, uint32_t n, uint32_t k,
 			  int8_t *w_tiled, float *w_scales);
 void c7x_pack_q4_0_to_w4a8_g64(const void *q4_0_data, uint32_t n, uint32_t k,

@@ -183,23 +183,28 @@ void c7x_pack_f32_to_w4a8_g64(const float *w_f32, uint32_t n, uint32_t k,
 	}
 }
 
-void c7x_pack_f32_to_w8a8(const float *w_f32, uint32_t n, uint32_t k,
-			  int8_t *w_tiled, float *w_scales)
+/* Stream-pack one 64-row output tile (`valid_rows` in 1..64) into W8A8. */
+void c7x_pack_f32_ntile_to_w8a8(const float *rows_f32, uint32_t valid_rows,
+				uint32_t k, uint32_t nt,
+				int8_t *w_tiled, float *w_scales)
 {
-	uint32_t n_pad = align64_u32(n);
 	uint32_t k_pad = align64_u32(k);
 	uint32_t kt_cnt = k_pad >> 6;
-	uint32_t row, kt, c;
+	uint32_t r, kt, c;
 
-	memset(w_tiled, 0, (size_t)(n_pad >> 6) * kt_cnt * 4096u);
-	for (row = 0u; row < n_pad; row++) {
+	if (valid_rows > 64u) {
+		valid_rows = 64u;
+	}
+	for (kt = 0u; kt < kt_cnt; kt++) {
+		memset(w_tiled + ((size_t)nt * kt_cnt + kt) * 4096u, 0, 4096u);
+	}
+	for (r = 0u; r < 64u; r++) {
+		uint32_t row = nt * 64u + r;
 		float amax = 0.0f;
 		float sc, inv;
-		uint32_t nt = row >> 6;
-		uint32_t r  = row & 63u;
 
-		if (row < n) {
-			const float *src = w_f32 + (size_t)row * k;
+		if (r < valid_rows) {
+			const float *src = rows_f32 + (size_t)r * k;
 			for (c = 0u; c < k; c++) {
 				float v = fabsf(src[c]);
 				if (v > amax) amax = v;
@@ -209,8 +214,8 @@ void c7x_pack_f32_to_w8a8(const float *w_f32, uint32_t n, uint32_t k,
 		w_scales[row] = sc;
 		inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
 
-		if (row < n && sc > 0.0f) {
-			const float *src = w_f32 + (size_t)row * k;
+		if (r < valid_rows && sc > 0.0f) {
+			const float *src = rows_f32 + (size_t)r * k;
 			for (kt = 0u; kt < kt_cnt; kt++) {
 				int8_t *tile = w_tiled + ((size_t)nt * kt_cnt + kt) * 4096u;
 				for (c = 0u; c < 64u; c++) {
@@ -224,6 +229,22 @@ void c7x_pack_f32_to_w8a8(const float *w_f32, uint32_t n, uint32_t k,
 				}
 			}
 		}
+	}
+}
+
+void c7x_pack_f32_to_w8a8(const float *w_f32, uint32_t n, uint32_t k,
+			  int8_t *w_tiled, float *w_scales)
+{
+	uint32_t n_pad = align64_u32(n);
+	uint32_t nt_cnt = n_pad >> 6;
+	uint32_t nt;
+
+	for (nt = 0u; nt < nt_cnt; nt++) {
+		uint32_t row0 = nt * 64u;
+		uint32_t valid = (n > row0) ? (n - row0) : 0u;
+		if (valid > 64u) valid = 64u;
+		c7x_pack_f32_ntile_to_w8a8(w_f32 + (size_t)row0 * k, valid,
+					   k, nt, w_tiled, w_scales);
 	}
 }
 

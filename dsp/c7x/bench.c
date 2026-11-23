@@ -34,6 +34,7 @@ static inline void mfence2(void)
 
 static inline void cache_in_all(void)
 {
+	mfence2();
 	ai64_l1d_wbinv_all();
 	mfence2();
 	ai64_l2_wbinv_all();
@@ -42,9 +43,16 @@ static inline void cache_in_all(void)
 
 static inline void cache_out_all(void)
 {
+	volatile uint32_t sink;
+
+	mfence2();
 	ai64_l1d_wbinv_all();
 	mfence2();
 	ai64_l2_wbinv_all();
+	mfence2();
+	/* Non-posted DDR read drains C7x->MSMC->LPDDR4 posted write queue before done_seq. */
+	sink = *(volatile uint32_t *)(uintptr_t)C7X_DDR_ARENA_BASE;
+	(void)sink;
 	mfence2();
 }
 

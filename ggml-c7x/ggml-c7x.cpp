@@ -109,7 +109,11 @@ static bool c7x_tensor_can_repack(const struct ggml_tensor * t) {
     }
     switch (t->type) {
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q8_0:
             return true;
         default:
@@ -117,16 +121,34 @@ static bool c7x_tensor_can_repack(const struct ggml_tensor * t) {
     }
 }
 
+static bool c7x_prefer_w8a8() {
+    static const bool pref = []() {
+        const char * e = std::getenv("GGML_C7X_W8A8");
+        if (!e || e[0] == '\0' || e[0] == '0' ||
+            e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N') {
+            return false;
+        }
+        if ((e[0] == 'o' || e[0] == 'O') && (e[1] == 'f' || e[1] == 'F')) {
+            return false;
+        }
+        return true;
+    }();
+    return pref;
+}
+
 static size_t c7x_tensor_packed_size(const struct ggml_tensor * t,
                                      c7x_weight_fmt * fmt_out,
                                      size_t * scales_off_out) {
     const uint32_t k = (uint32_t) t->ne[0];
     const uint32_t n = (uint32_t) t->ne[1];
-    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_K) {
+    if ((t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_K) && !c7x_prefer_w8a8()) {
         if (fmt_out) *fmt_out = C7X_WFMT_W4A8_G64;
         return c7x_w4a8_g64_packed_bytes(n, k, scales_off_out);
     }
-    if (t->type == GGML_TYPE_Q8_0) {
+    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_1 ||
+        t->type == GGML_TYPE_Q5_0 || t->type == GGML_TYPE_Q5_K ||
+        t->type == GGML_TYPE_Q6_K ||
+        ((t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_K) && c7x_prefer_w8a8())) {
         if (fmt_out) *fmt_out = C7X_WFMT_W8A8;
         return c7x_w8a8_packed_bytes(n, k, scales_off_out);
     }
@@ -246,6 +268,33 @@ static bool c7x_unpack_repacked_to_raw(ggml_backend_c7x_buffer_context * bctx,
         }
         return true;
     }
+    if (meta.fmt == C7X_WFMT_W8A8 &&
+        (meta.type == GGML_TYPE_Q4_0 || meta.type == GGML_TYPE_Q4_K ||
+         meta.type == GGML_TYPE_Q4_1 || meta.type == GGML_TYPE_Q5_0 ||
+         meta.type == GGML_TYPE_Q5_K || meta.type == GGML_TYPE_Q6_K)) {
+        std::vector<float> row_f32(meta.k);
+        const size_t row_bytes = ggml_row_size(meta.type, meta.k);
+        const int8_t * w_tiled = reinterpret_cast<const int8_t *>(packed.data());
+        const float * scales = reinterpret_cast<const float *>(packed.data() + meta.scales_off);
+        for (uint32_t r = 0; r < meta.n; r++) {
+            c7x_unpack_w8a8_row_f32(w_tiled, scales, r, meta.k, row_f32.data());
+            uint8_t * dst_row = raw_out.data() + (size_t) r * row_bytes;
+            if (meta.type == GGML_TYPE_Q4_0) {
+                quantize_row_q4_0_ref(row_f32.data(), reinterpret_cast<block_q4_0 *>(dst_row), meta.k);
+            } else if (meta.type == GGML_TYPE_Q4_K) {
+                quantize_row_q4_K_ref(row_f32.data(), reinterpret_cast<block_q4_K *>(dst_row), meta.k);
+            } else if (meta.type == GGML_TYPE_Q4_1) {
+                quantize_row_q4_1_ref(row_f32.data(), reinterpret_cast<block_q4_1 *>(dst_row), meta.k);
+            } else if (meta.type == GGML_TYPE_Q5_0) {
+                quantize_row_q5_0_ref(row_f32.data(), reinterpret_cast<block_q5_0 *>(dst_row), meta.k);
+            } else if (meta.type == GGML_TYPE_Q5_K) {
+                quantize_row_q5_K_ref(row_f32.data(), reinterpret_cast<block_q5_K *>(dst_row), meta.k);
+            } else {
+                quantize_row_q6_K_ref(row_f32.data(), reinterpret_cast<block_q6_K *>(dst_row), meta.k);
+            }
+        }
+        return true;
+    }
     return false;
 }
 
@@ -267,11 +316,11 @@ static bool c7x_repack_from_host(ggml_backend_c7x_buffer_context * bctx,
     }
 
     std::vector<uint8_t> packed(packed_sz, 0);
-    if (t->type == GGML_TYPE_Q4_0) {
+    if (t->type == GGML_TYPE_Q4_0 && fmt == C7X_WFMT_W4A8_G64) {
         c7x_pack_q4_0_to_w4a8_g64(raw_host_data, n, k,
                                   packed.data(),
                                   reinterpret_cast<float *>(packed.data() + scales_off));
-    } else if (t->type == GGML_TYPE_Q4_K) {
+    } else if (t->type == GGML_TYPE_Q4_K && fmt == C7X_WFMT_W4A8_G64) {
         // Stream 64 rows at a time (~500 KiB temp instead of ~0.9 GB for huge vocab matrices!)
         const uint32_t nt_cnt = ((n + 63u) & ~63u) >> 6;
         const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_K, k);
@@ -292,6 +341,38 @@ static bool c7x_repack_from_host(ggml_backend_c7x_buffer_context * bctx,
         c7x_pack_q8_0_to_w8a8(raw_host_data, n, k,
                               reinterpret_cast<int8_t *>(packed.data()),
                               reinterpret_cast<float *>(packed.data() + scales_off));
+    } else if (fmt == C7X_WFMT_W8A8 &&
+               (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_K ||
+                t->type == GGML_TYPE_Q4_1 || t->type == GGML_TYPE_Q5_0 ||
+                t->type == GGML_TYPE_Q5_K || t->type == GGML_TYPE_Q6_K)) {
+        const uint32_t nt_cnt = ((n + 63u) & ~63u) >> 6;
+        const size_t row_bytes = ggml_row_size(t->type, k);
+        std::vector<float> tile_f32((size_t) 64u * k);
+        const uint8_t * raw_bytes = (const uint8_t *) raw_host_data;
+        int8_t * w_tiled = reinterpret_cast<int8_t *>(packed.data());
+        float  * scales  = reinterpret_cast<float *>(packed.data() + scales_off);
+        for (uint32_t nt = 0; nt < nt_cnt; nt++) {
+            uint32_t row0 = nt * 64u;
+            uint32_t valid = std::min<uint32_t>(64u, n - row0);
+            for (uint32_t r = 0; r < valid; r++) {
+                const uint8_t * src_row = raw_bytes + (size_t)(row0 + r) * row_bytes;
+                float * dst_row = tile_f32.data() + (size_t) r * k;
+                if (t->type == GGML_TYPE_Q4_0) {
+                    dequantize_row_q4_0(reinterpret_cast<const block_q4_0 *>(src_row), dst_row, k);
+                } else if (t->type == GGML_TYPE_Q4_K) {
+                    dequantize_row_q4_K(reinterpret_cast<const block_q4_K *>(src_row), dst_row, k);
+                } else if (t->type == GGML_TYPE_Q4_1) {
+                    dequantize_row_q4_1(reinterpret_cast<const block_q4_1 *>(src_row), dst_row, k);
+                } else if (t->type == GGML_TYPE_Q5_0) {
+                    dequantize_row_q5_0(reinterpret_cast<const block_q5_0 *>(src_row), dst_row, k);
+                } else if (t->type == GGML_TYPE_Q5_K) {
+                    dequantize_row_q5_K(reinterpret_cast<const block_q5_K *>(src_row), dst_row, k);
+                } else {
+                    dequantize_row_q6_K(reinterpret_cast<const block_q6_K *>(src_row), dst_row, k);
+                }
+            }
+            c7x_pack_f32_ntile_to_w8a8(tile_f32.data(), valid, k, nt, w_tiled, scales);
+        }
     } else {
         return false;
     }
@@ -613,6 +694,17 @@ static bool flush_cmdbuf(ggml_backend_c7x_context * ctx) {
         ctx->cmd_nodes.clear();
         return false;
     }
+    static const int profile = []() {
+        const char * e = std::getenv("GGML_C7X_PROFILE");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (profile == 1) {
+        fprintf(stderr, "ggml-c7x: EXEC_LIST cmds=%u dsp=%.2f ms total_dsp=%.2f ms wall=%.2f ms\n",
+                stats.cmds_done,
+                (double) stats.cycles / 1e6,
+                (double) stats.total_cycles / 1e6,
+                stats.wall_us / 1e3);
+    }
     c7x_cmdbuf_reset(ctx->cmdbuf);
     ctx->cmd_nodes.clear();
     return true;
@@ -678,6 +770,8 @@ static bool lower_node(ggml_backend_c7x_context * ctx,
                     return false;
                 }
                 const uint64_t m_total = (uint64_t) src1->ne[1] * src1->ne[2] * src1->ne[3];
+                // Always hand L2 scratch to mma_kernels when DRU is available: mma_kernels places
+                // tile_acc in L2 SRAM and enforces its own >=1 MiB (m=1) / >=128 KiB (m>1) / DDR-only gates.
                 cmd.op    = (rm.fmt == C7X_WFMT_W4A8_G64) ? C7X_CMD_MATMUL_W4A8_G64 : C7X_CMD_MATMUL_W8A8;
                 cmd.flags = ctx->dev_ctx->info.dru_ok ? C7X_CMD_FLAG_USE_DRU : 0u;
                 cmd.p0    = (uint32_t) m_total;
@@ -1028,8 +1122,63 @@ static void ggml_backend_c7x_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_c7x_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_backend_c7x_context *>(backend->context);
+    static const int profile = []() {
+        const char * e = std::getenv("GGML_C7X_PROFILE");
+        return e ? std::atoi(e) : 0;
+    }();
     c7x_cmdbuf_reset(ctx->cmdbuf);
     ctx->cmd_nodes.clear();
+
+    if (profile >= 2) {
+        std::unordered_map<std::string, std::pair<uint32_t, uint64_t>> by_key;
+        uint64_t total_cyc = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(node)) continue;
+            if (!lower_node(ctx, backend->device, node)) {
+                GGML_LOG_ERROR("ggml-c7x: failed to lower node %d (%s, op=%s)\n",
+                               i, node->name, ggml_op_name(node->op));
+                return GGML_STATUS_FAILED;
+            }
+            if (c7x_cmdbuf_count(ctx->cmdbuf) > 0u) {
+                struct c7x_exec_stats st {};
+                if (c7x_cmdbuf_submit(ctx->dev_ctx->rt, ctx->cmdbuf, &st) != 0) {
+                    GGML_LOG_ERROR("ggml-c7x: PROFILE=2 EXEC_LIST failed at node %d (%s, op=%s, done=%u)\n",
+                                   i, node->name, ggml_op_name(node->op), st.cmds_done);
+                    c7x_cmdbuf_reset(ctx->cmdbuf);
+                    ctx->cmd_nodes.clear();
+                    return GGML_STATUS_FAILED;
+                }
+                std::string key = ggml_op_name(node->op);
+                if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+                    key += ":";
+                    key += ggml_type_name(node->src[0]->type);
+                    if (node->src[0]->nb[0] != ggml_type_size(node->src[0]->type)) {
+                        key += "(T)";
+                    }
+                    if (node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_F32) {
+                        key += ":k" + std::to_string(node->src[0]->ne[0]) +
+                               "n" + std::to_string(node->src[0]->ne[1]) +
+                               "m" + std::to_string(node->src[1]->ne[1]);
+                    } else {
+                        key += ":m=" + std::to_string(node->src[1]->ne[1]);
+                    }
+                }
+                auto & e = by_key[key];
+                e.first++;
+                e.second += st.cycles;
+                total_cyc += st.cycles;
+                c7x_cmdbuf_reset(ctx->cmdbuf);
+                ctx->cmd_nodes.clear();
+            }
+        }
+        fprintf(stderr, "=== ggml-c7x per-op DSP profile (total=%.2f ms) ===\n", (double) total_cyc / 1e6);
+        for (const auto & kv : by_key) {
+            fprintf(stderr, "  %-28s x%-4u : %7.2f ms\n",
+                    kv.first.c_str(), kv.second.first, (double) kv.second.second / 1e6);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -1179,9 +1328,7 @@ static bool ggml_backend_c7x_dev_supports_op(ggml_backend_dev_t dev, const struc
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {
                 return true;
             }
-            if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K ||
-                 src0->type == GGML_TYPE_Q8_0) &&
-                c7x_tensor_can_repack(src0) &&
+            if (c7x_tensor_can_repack(src0) &&
                 ggml_is_contiguous(src1) && ggml_is_contiguous(op)) {
                 // Only accept llama_model_loader's 0-byte probe buffer or actual WEIGHTS buffers
                 // so supports_op never promises quantized MUL_MAT on unallocated/non-WEIGHTS tensors.
@@ -1280,7 +1427,9 @@ static bool ggml_backend_c7x_dev_supports_op(ggml_backend_dev_t dev, const struc
             if (!src0 || !idx || idx->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32) {
                 return false;
             }
-            if (src0->type == GGML_TYPE_Q4_K) {
+            if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q4_1 ||
+                src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_K ||
+                src0->type == GGML_TYPE_Q6_K) {
                 return c7x_lookup_repacked(src0, dev, nullptr);
             }
             return ggml_type_to_c7x_dtype(src0->type, &dt) &&

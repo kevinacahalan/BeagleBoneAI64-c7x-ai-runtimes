@@ -51,7 +51,6 @@ static int test_weight_roundtrip_and_partial_write(ggml_backend_t c7x) {
     struct ggml_init_params ip { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
     struct ggml_context * ctx = ggml_init(ip);
     struct ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, N);
-    struct ggml_tensor * A = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, M);
     ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(c7x));
     ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
