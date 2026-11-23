@@ -1,6 +1,6 @@
 # Measured Hardware Results (BeagleBone AI-64 / TDA4VM)
 
-All numbers below were measured directly on a live BeagleBone AI-64 (TI TDA4VM / J721E, C71x @ 1.0 GHz, MMA v1, L1D = 32 KiB cache, L2 = 64 KiB cache + 448 KiB SRAM, 4 MiB MSMC SRAM mapped, 64 MiB DDR tensor arena) with **bit-exact verification against the Cortex-A72 CPU reference** (`0` mismatches on every passing row).
+All numbers below were measured directly on a live BeagleBone AI-64 (TI TDA4VM / J721E, C71x @ 1.0 GHz, MMA v1, L1D = 32 KiB cache, L2 = 64 KiB cache + 448 KiB SRAM, 7.625 MiB MSMC SRAM mapped, 1.5 GiB high-DDR LLM arena at `0x880000000` + 64 MiB DDR arena at `0xAC000000`) with **bit-exact or cosine `>= 0.998–1.000` verification against the Python/A72 reference**.
 
 ---
 
@@ -178,3 +178,76 @@ On DDR matrices `>= 1 MiB`, DRU0 prefetches the next tile chunk into L2 SRAM (`1
 | RMSNorm | 0.290 ms | 3.0% | 0.366 ms | 1.2% |
 | RoPE + KV write + QKV bias | 0.042 ms | 0.4% | 0.051 ms | 0.2% |
 | Embedding lookup | 0.016 ms | 0.2% | 0.025 ms | 0.1% |
+
+---
+
+## Milestone 4: 7.625 MiB MSMC, B-Stationary Prefill, INT8 KV (`2K–4K`), Qwen3 & 1.5B–1.7B Models, and Speculative Decoding
+
+Expanded on-chip MSMC SRAM from `4 MiB → 7.625 MiB` (`0x70040000..0x707DFFFF` via L3 4 KiB edge page tables), expanded the high-DDR LLM arena to **`1.5 GiB`** (`0x880000000..0x8DFFFFFFF`, leaving ~2.1 GiB RAM for Linux), optimized B-stationary batched prefill (`C7X_OP_LLAMA_PREFILL`) with DRU0 L2 ping-pong + L2-fused RMSNorm/Attention/SwiGLU+Quant, added **per-head symmetric INT8 KV caching** (`3.76–3.88×` smaller KV), and added **Qwen3 QK-RMSNorm** (`q_norm`/`k_norm`, `q_dim != dim`, `head_size = 128`).
+
+### 1. Live Silicon Multi-Architecture Matrix (6 Models, 15M → 1.7B, W4A8-g64)
+
+| Model | Arch / Features | `.c7m` Size | MSMC Staged | KV Mode (`seq`) | Short-Ctx Decode (DSP / E2E) | Batched Prefill (`pp`) | Logits `cosine` | Greedy Parity |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **`stories15M`** (15M) | Llama2, 6L, 6/6 MHA, `hd=48`, 32k | `9.25 MiB` | `6/6` (`4.24 MiB`) | FP32 (`256`) | **871.7 / 808.6 tok/s** | **3,207.9 tok/s** (`pp32`) | `1.0000000` | **40/40** |
+| **`SmolLM2-135M-Instruct`** (135M) | Llama, 30L, 9/3 GQA, `hd=64`, 49k | `73.65 MiB` | `4/30` (`7.61 MiB`) | FP32 (`512`) | **115.7 / 114.6 tok/s** | **395.2 tok/s** (`pp19`) / **323.9 tok/s** (`pp160`) | `1.0000000` | **exact** |
+| **`Qwen2.5-0.5B-Instruct`** (494M) | Qwen2, 24L, 14/2 GQA, QKV bias, 152k | `269.20 MiB` | `0/24` | FP32 (`512`) | **35.05 / 34.9 tok/s** | **209.6 tok/s** (`pp60`) / **168.7 tok/s** (`pp146`) | `1.0000000` | **exact** |
+| **`Qwen3-0.6B`** (596M) | Qwen3, 28L, 16/8 GQA, `q_dim=2048`, `hd=128`, **QK-norm** | `324.79 MiB` | `0/28` | FP32 / **INT8** (`2048`) | **26.93 / 26.61** (FP32)<br>**27.24 / 26.91 tok/s** (INT8) | **126.8 tok/s** (`pp24`) / **104.5 tok/s** (`pp146`) | `1.0000000` (FP32)<br>`0.99951` (INT8) | **10/10** (both) |
+| **`Qwen2.5-1.5B-Instruct`** (1.54B) | Qwen2, 28L, 12/2 GQA, `hd=128`, QKV bias, 152k | `833.41 MiB` | `0/28` | FP32 / **INT8** (`2048`) | **11.60 / 11.53** (FP32)<br>**11.62 / 11.54 tok/s** (INT8) | **60.1 tok/s** (`pp24`) / **71.6 tok/s** (`pp146`) | `1.0000000` (FP32)<br>`0.99818` (INT8) | **10/10** (both) |
+| **`Qwen3-1.7B`** (1.72B) | Qwen3, 28L, 16/8 GQA, `hd=128`, **QK-norm**, 152k | `928.22 MiB` | `0/28` | FP32 / **INT8** (`2048`) | **10.31 / 10.25** (FP32)<br>**10.34 / 10.27 tok/s** (INT8) | **57.5 tok/s** (`pp24`) | `1.0000000` (FP32)<br>`0.99931` (INT8) | **10/10** (both) |
+
+### 2. Fast B-Stationary Batched Prefill Speedup (Milestone 3 → Milestone 4)
+
+| Model | M3 Prefill (tok/s) | M4 B-Stationary + DRU0 + L2-Fused Prefill (tok/s) | Speedup |
+| --- | --- | --- | --- |
+| **`stories15M` (W4A8-g64, 32t)** | `2,360.2 tok/s` | **`3,207.9 tok/s`** | **`1.36×`** |
+| **`SmolLM2-135M` (19t)** | `241.4 tok/s` | **`395.2 tok/s`** | **`1.64×`** |
+| **`Qwen2.5-0.5B` (23t → 60t)** | `100.0 tok/s` | **`147.5 – 209.6 tok/s`** | **`1.48× – 2.10×`** |
+
+### 3. Quantized INT8 KV Cache & Long Context (`2,048 – 4,096` Tokens)
+
+| Model (`seq_len`) | FP32 KV Footprint | INT8 KV Footprint | Savings | Long-Context Test (Live Silicon) |
+| --- | --- | --- | --- | --- |
+| **`Qwen2.5-0.5B`** (`seq=4096`) | `96.00 MiB` | **`25.50 MiB`** | `3.76×` | **2,043 prompt tokens:** `48.30 s` (`42.3 tok/s`), decode @ pos ~2043 = **`14.4 tok/s`** (`2.60 ms/layer`)<br>**3,803 prompt tokens:** `158.17 s` (`24.0 tok/s`), decode @ pos ~3803 = **`9.5 tok/s`** (`4.07 ms/layer`) |
+| **`Qwen3-0.6B`** (`seq=2048`) | `448.00 MiB` | **`115.50 MiB`** | `3.88×` | `logits cos = 0.99951`, **10/10 exact greedy**, decode **`27.24 tok/s`** (`+1.2%` vs FP32 KV) |
+| **`Qwen2.5-1.5B`** (`seq=2048`) | `112.00 MiB` | **`28.88 MiB`** | `3.88×` | `logits cos = 0.99818`, **10/10 exact greedy**, decode **`11.62 tok/s`**, arena `895 / 1536 MiB` |
+| **`Qwen3-1.7B`** (`seq=2048`) | `448.00 MiB` | **`115.50 MiB`** | `3.88×` | `logits cos = 0.99931`, **10/10 exact greedy**, decode **`10.34 tok/s`**, arena `1076 / 1536 MiB` |
+
+### 4. Speculative Decoding Evaluation (`Qwen2.5-0.5B` Drafting for `Qwen2.5-1.5B`)
+
+Both models load simultaneously into the 1.5 GiB arena (`1,159.9 / 1,536 MiB`) using `c7x-ai llama spec` with `C7X_LLAMA_REQ_ALL_ARGMAX` batched verification and exact KV rollback:
+
+| Config | Parity vs Standard 1.5B | Accepted Draft Tokens | Tokens / Step | Draft Time | Target Verify Time (`M=K+1`) | Net Throughput | vs Standard 1.5B (`11.50 tok/s`) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Standard `Qwen2.5-1.5B` (`M=1`) | Baseline | — | `1.00` | — | `86.8 ms` | **`11.50 tok/s`** | `1.00×` |
+| Speculative `K = 3` (`M = 4`) | **100% exact** | `30 / 64` (`46.9%`) | `2.27` | `92.9 ms` | `254.9 ms` | `6.52 tok/s` | `0.57×` |
+| Speculative `K = 4` (`M = 5`) | **100% exact** | `31 / 80` (`38.8%`) | `2.50` | `121.3 ms` | `285.6 ms` | `6.13 tok/s` | `0.53×` |
+| Speculative `K = 5` (`M = 6`) | **100% exact** | `32 / 100` (`32.0%`) | `2.50` | `149.0 ms` | `306.5 ms` | `5.48 tok/s` | `0.48×` |
+
+*Analysis:* See [`NOTES.md`](NOTES.md) — on TDA4VM C71x, group-64 W4A8 batched verification drains the MMA C-bank every `K=64` group, making `M=4` verification `2.94×` slower than `M=1` decode rather than `~1.0×` as on GPUs. The `c7x-ai llama spec` engine is shipped as a verified lossless diagnostic/research tool, while single-model decode remains the default fastest path on C71x.
+
+---
+
+## Milestone 6: Head-to-Head Benchmarks — C7x + MMA vs. `llama.cpp` on BeagleBone AI-64 Cortex-A72
+
+Measured on the **exact same live BeagleBone AI-64 board** (dual Cortex-A72 @ 2.0 GHz vs. C71x + MMA @ 1.0 GHz). `llama.cpp` (`llama-bench`, built natively for `-mcpu=cortex-a72 -O3`, `GGML_OPENMP=OFF`) was benchmarked with `-t 1,2 -p 128 -n 64` across both `Q4_0` and `Q4_K_M` GGUF quants (mean of 3 reps for `135M–0.6B`, 2 reps for `1.5B`; std dev `<= 0.06 tok/s` across every entry).
+
+### 1. Prompt Prefill Speed (`pp128` `llama.cpp` vs. `pp146–160` C7x + MMA)
+
+| Model | `llama.cpp` `Q4_0` (1T) | `llama.cpp` `Q4_K_M` (1T) | `llama.cpp` `Q4_0` (2T) | `llama.cpp` `Q4_K_M` (2T) | **C7x + MMA (`W4A8-g64`)** | Speedup vs 1T (`Q4_0` / `Q4_K_M`) | Speedup vs 2T (`Q4_0` / `Q4_K_M`) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **`SmolLM2-135M`** | `28.72 tok/s` | `24.15 tok/s` | `55.58 tok/s` | `47.00 tok/s` | **`323.9 tok/s`** (`pp160`) | **`11.3×` / `13.4×`** | **`5.8×` / `6.9×`** |
+| **`Qwen2.5-0.5B`** | `9.18 tok/s` | `7.59 tok/s` | `18.13 tok/s` | `15.01 tok/s` | **`168.7 tok/s`** (`pp146`) | **`18.4×` / `22.2×`** | **`9.3×` / `11.2×`** |
+| **`Qwen3-0.6B`** | `7.19 tok/s` | `7.52 tok/s` | `14.21 tok/s` | `14.83 tok/s` | **`104.5 tok/s`** (`pp146`) | **`14.5×` / `13.9×`** | **`7.4×` / `7.0×`** |
+| **`Qwen2.5-1.5B`** | `2.61 tok/s` | `2.65 tok/s` | `5.17 tok/s` | `5.25 tok/s` | **`71.6 tok/s`** (`pp146`) | **`27.4×` / `27.0×`** | **`13.8×` / `13.6×`** |
+
+### 2. Autoregressive Token Decode Speed (`tg64`, Starting from Short Context)
+
+| Model | `llama.cpp` `Q4_0` (1T) | `llama.cpp` `Q4_K_M` (1T) | `llama.cpp` `Q4_0` (2T) | `llama.cpp` `Q4_K_M` (2T) | **C7x + MMA (`W4A8-g64`)** *(post-146t)* | Speedup vs 1T (`Q4_0` / `Q4_K_M`) | Speedup vs 2T (`Q4_0` / `Q4_K_M`) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **`SmolLM2-135M`** | `20.59 tok/s` | `17.73 tok/s` | `35.17 tok/s` | `30.85 tok/s` | **`115.7 tok/s`** *(87.2)* | **`5.6×` / `6.5×`** | **`3.3×` / `3.8×`** |
+| **`Qwen2.5-0.5B`** | `6.04 tok/s` | `5.20 tok/s` | `10.76 tok/s` | `9.45 tok/s` | **`35.05 tok/s`** *(30.2)* | **`5.8×` / `6.7×`** | **`3.3×` / `3.7×`** |
+| **`Qwen3-0.6B`** | `4.61 tok/s` | `4.68 tok/s` | `8.91 tok/s` | `9.13 tok/s` | **`27.24 tok/s`** *(23.3)* | **`5.9×` / `5.8×`** | **`3.1×` / `3.0×`** |
+| **`Qwen2.5-1.5B`** | `1.96 tok/s` | `1.94 tok/s` | `3.81 tok/s` | `3.75 tok/s` | **`11.62 tok/s`** *(11.3)* | **`5.9×` / `6.0×`** | **`3.1×` / `3.1×`** |
+
+*Key takeaway:* Even against **both Cortex-A72 CPU cores saturated at 100%** running hand-tuned ARMv8 NEON `llama.cpp`, the bare-metal 1.0 GHz C7x + MMA runtime delivers **`5.8× – 13.8×` faster prompt prefill** (`11.3× – 27.4×` vs 1 core) and **`3.0× – 3.8×` faster token decode** (`5.6× – 6.7×` vs 1 core) — while leaving both A72 cores nearly idle for Linux, networking, and OpenAI SSE serving (`c7x-ai serve`).

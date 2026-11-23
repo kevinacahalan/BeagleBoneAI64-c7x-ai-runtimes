@@ -50,7 +50,7 @@ engine_run() {
 ensure_image() {
 	local tag=$1 file=$2
 	select_engine
-	if ! "$AI64_CONTAINER_ENGINE" image exists "$tag" 2>/dev/null; then
+	if ! "$AI64_CONTAINER_ENGINE" image inspect "$tag" >/dev/null 2>&1; then
 		engine_build -t "$tag" -f "$file" "$(dirname "$file")"
 	fi
 }

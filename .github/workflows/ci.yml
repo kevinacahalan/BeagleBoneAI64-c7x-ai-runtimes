@@ -1,0 +1,35 @@
+name: Build and Host Emulation CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build containers, run C7000 host-emulation tests, and compile DSP + Linux + DTBO
+        env:
+          AI64_CONTAINER_ENGINE: docker
+        run: ./beagle-linux/scripts/build.sh all
+
+      - name: Verify build artifacts exist
+        run: |
+          test -f dsp/build/c7x-ai.elf
+          test -x linux-app/c7x-ai
+          test -f beagle-linux/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo
+
+      - name: Set up Python & NumPy for reference / converter self-tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Python converter & reference self-tests
+        run: |
+          python3 -m pip install --quiet numpy
+          python3 tools/convert_hf.py --self-test
+          python3 -c "import sys; sys.path.insert(0, 'tools'); import llama_ref as r, numpy as np; w = np.random.default_rng(0).standard_normal((64, 64)).astype(np.float32); pk, sc, deq = r.quantize_weight_w4a8_g64(w); assert pk.shape == (1, 1, 32, 64) and sc.shape == (1, 1, 64); assert np.allclose(r.vexpf_f32(np.array([-200.0, -1.0, 0.0, 1.0, 10.0], np.float32)), np.exp(np.array([-200.0, -1.0, 0.0, 1.0, 10.0], np.float32)), rtol=1e-5, atol=1e-6); print('llama_ref_selftest: PASS')"

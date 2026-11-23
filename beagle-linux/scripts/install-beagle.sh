@@ -45,7 +45,7 @@ fi
 if [[ -d $OVERLAY_DIR && -f $EXTLINUX ]]; then
 	install -m 0644 "$DTBO" "$OVERLAY_DIR/$OVERLAY"
 	echo "Installed $OVERLAY into $OVERLAY_DIR."
-	echo "Add '/overlays/$OVERLAY' to fdtoverlays in $EXTLINUX and reboot if the DDR arenas (0xac000000 / 0xc0000000) are not already reserved."
+	echo "Add '/overlays/$OVERLAY' to fdtoverlays in $EXTLINUX and reboot if the DDR arenas (0xac000000 / 0x880000000) are not already reserved."
 fi
 
 echo "Done. Run: c7x-ai load && c7x-ai bench all"
