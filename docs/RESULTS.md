@@ -311,3 +311,32 @@ Zero-dependency standard `.onnx` binary protobuf loader & compiler (`ort-c7x-ep/
 | **`audio_enc_block.onnx`** | Whisper-style `Conv 3×3 s=2` + `Gelu(tanh)` + `LayerNormalization` + `MatMul` FFN + residual `Add` | `7` | **`cos = 1.000000`**<br>**`max_err = 0.000000`** | **`1.13 ms`** | **`1.13 ms`** | **`882.6 FPS`** |
 | **`QLinearMatMul 60×256×256`** | Asymmetric `UINT8 (zp=133) × INT8 (zp=-7) → UINT8 (zp=120)`, per-channel scales, `int32` bias | `1` | **`max_qdiff = 0`** *(bit-exact)* | **`0.400 ms`** | **`0.405 ms`** | **`19.6 GOPS` (`4.75×` vs A72 `1.90 ms`)** |
 | **`QLinearMatMul 5×70×70` (`Y_F32`)** | Unaligned non-16-multiple `N=70` float32 output (`280 B` row stride) + half-to-even tie check | `1` | **`max_err = 0.000000`** *(bit-exact)* | — | — | Verified on live C71x silicon (`VST16W` alignment guard) |
+
+---
+
+## Milestone 9: Unified Board Bundle, `ggml-c7x` FlashAttention-2 + Fusion + `Q8_0` KV, and Hybrid `ort-c7x-ep`
+
+### 1. Unified Board Bundle (`build.sh bundle` + `install-beagle.sh`)
+
+`./platform/beagle-linux/scripts/build.sh bundle` now packages all three inference paths into `out/c7x-ai-beagle/`, and `install-beagle.sh` (portable across Debian and BusyBox/Yocto without GNU `install`) installs `/usr/bin/c7x-ai`, `/lib/firmware/c7x-ai.elf`, `/usr/lib/c7x-ai/libggml-c7x.so`, `/usr/lib/c7x-ai/libort-c7x-ep.so`, `/usr/lib/c7x-ai/test_ort_c7x_ep`, and `/usr/share/c7x-ai/models/*` in a single deploy step.
+
+### 2. `ggml-c7x` Decode Speedup: Native `FLASH_ATTN_EXT`, Peephole Fusion, & `Q8_0` KV Cache
+
+Added `C7X_CMD_FLASH_ATTN_EXT` (`GGML_OP_FLASH_ATTN_EXT`, L2-staged active-mask FlashAttention-2 supporting `F16`/`F32`/`Q8_0` K&V, GQA, ALiBi, softcap, and sinks), lazy `l2_dirty` L1D cache writeback-invalidate in `c7x_cmd_exec_list`, cached RoPE `freq_tab`/sin-cos tables, 16-wide SIMD `Q8_0` quant/dequant, and peephole `RMS_NORM+MUL` / `SILU+MUL` fusion (`665 → 514` commands/token, DSP decode time `16.58 → 12.20 ms` = **`-26.4%`**):
+
+| `SmolLM2-135M Q4_0` Mode (Live Silicon, `llama-bench -ngl 99`) | KV Cache | `pp128` (`tok/s`) | `tg32` (`tok/s`) | vs 2T A72 (`46.19` / `28.62`) | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| Pre-PR-#2 `ggml-c7x` (`-fa 0`) | F16 | `175.07` | `47.71` | `3.79×` / `1.67×` | `665` cmds/tok, `16.58 ms` DSP |
+| **PR #2 `ggml-c7x` (`-fa 1`, stock default)** | **F16** | **`185.40 ± 0.01`** | **`54.71 – 55.34`** | **`4.01×` / `1.93×`** | `514` cmds/tok, **`12.20 ms` DSP (`+16.0%` decode)** |
+| **PR #2 `ggml-c7x` (`-fa 1 -ctk q8_0 -ctv q8_0`)** | **`Q8_0` (2× smaller)** | **`151.55 ± 0.03`** | **`49.00 ± 0.01`** | **`3.28×` / `1.71×`** | Halves KV RAM while still beating pre-PR-#2 F16 decode |
+
+- **Live Silicon Op Verification:** `test-backend-ops -b C7X0 -o FLASH_ATTN_EXT` **`3,648 / 3,648 PASS`**; `llama-perplexity` (`-c 128 --chunks 2`) matches `-fa 0` within `0.6%` (`76.34` vs `75.85`, chunk 1 `81.49` vs `81.51`).
+
+### 3. Hybrid `ort-c7x-ep` Subgraph Partitioning (`allow_cpu_fallback = 1`) & ORT C API Shim
+
+Enabled automatic multi-subgraph partitioning between C7x DSP command buffers and a built-in CPU fallback runner (`QuantizeLinear`, `Softmax`, exact erf `Gelu`, `Clip`, broadcast elementwise, `Transpose`, `Concat`, `ReduceMean`, `Resize`) when `opts.allow_cpu_fallback = 1` (keeping strict rejection by default at `0`), plus an ONNX Runtime C API shim (`OrtSessionOptionsAppendExecutionProvider_C7x` + `com.beagleboard.c7x::C7xCompiledGraph`, verified via `test_ort_c_api_shim`, `max_err = 0.000000`):
+
+| Hybrid ONNX Workload (Live Silicon, 20 iters) | Partitioning (`C7x` / `CPU`) | Accuracy vs Reference | C7x DSP | CPU Fallback | Wall Latency | Throughput |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| **`mobilenet_e2e_hybrid.onnx`** (`FP32` image → `QuantizeLinear` → 4L `QLinearConv`+`GAP`+`Gemm` → `Softmax`) | `1` C7x SG (`9` cmds) + `2` CPU ops | `cos = 1.000000`<br>`max_err = 0.000027` | `12.24 ms` | `1.39 ms` | **`13.83 ms`** | **`72.3 FPS`** |
+| **`whisper_erf_hybrid.onnx`** (`Conv` → `erf-Gelu` → `LN+MatMul` → `erf-Gelu` → `MatMul+Add` → `Softmax`) | `3` C7x SGs (`5` cmds) + `3` CPU ops | **`cos = 1.000000`**<br>**`max_err = 0.000000`** | `1.06 ms` | `3.55 ms` | **`5.25 ms`** | **`190.6 FPS`** |

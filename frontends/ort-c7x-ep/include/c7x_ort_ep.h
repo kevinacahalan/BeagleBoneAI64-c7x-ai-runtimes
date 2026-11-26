@@ -5,13 +5,14 @@
  * Provides:
  *   1. Capability query (`c7x_ort_ep_op_supported`) and ORT-compatible EP
  *      configuration (`struct c7x_ort_ep_options`).
- *   2. Zero-dependency standard ONNX `.onnx` binary protobuf loader & graph
- *      compiler (`c7x_ort_session_t`) that packs INT8/UINT8/FP32 weights into
- *      the C7x DDR/MSMC arena and lowers supported non-LLM graphs (Vision CNN,
- *      MobileNetV2-style QLinearConv, Audio/Whisper Conv+GELU+LayerNorm) into
- *      a single `C7X_OP_EXEC_LIST` RPC via `libc7x`.
- *   3. Optional upstream ONNX Runtime C API registration hook when compiled
- *      with `-DHAVE_ONNXRUNTIME_C_API`.
+ *   2. Zero-dependency standard ONNX `.onnx` binary protobuf loader & hybrid
+ *      graph compiler (`c7x_ort_session_t`) that packs INT8/UINT8/FP32 weights
+ *      into the C7x DDR/MSMC arena, lowers contiguous C7x-supported subgraphs
+ *      into single `C7X_OP_EXEC_LIST` RPCs via `libc7x`, and optionally partitions
+ *      unsupported ops (QuantizeLinear, Softmax, erf-Gelu, Resize, Clip, etc.)
+ *      onto built-in CPU fallback kernels (`allow_cpu_fallback = 1`).
+ *   3. Upstream ONNX Runtime C API registration hook (`ort_c_api_shim.cpp`)
+ *      when compiled with `-DHAVE_ONNXRUNTIME_C_API`.
  */
 #ifndef ORT_C7X_EP_H_
 #define ORT_C7X_EP_H_
@@ -34,10 +35,11 @@ enum c7x_ort_dtype {
 };
 
 struct c7x_ort_ep_options {
-	int      use_msmc_weights; /* Stage qualifying weights into on-chip MSMC SRAM */
-	int      enable_profiling; /* Print per-run DSP / wall-clock timing to stderr */
-	int      force_hostemu;    /* 0 = AUTO (HW if /dev/mem + C7AI present, else hostemu) */
-	size_t   emu_ddr_bytes;    /* Hostemu DDR arena size (0 = 256 MiB default) */
+	int      use_msmc_weights;   /* Stage qualifying weights into on-chip MSMC SRAM */
+	int      enable_profiling;   /* Print per-run DSP / wall-clock timing to stderr */
+	int      force_hostemu;      /* 0 = AUTO (HW if /dev/mem + C7AI present, else hostemu) */
+	size_t   emu_ddr_bytes;      /* Hostemu DDR arena size (0 = 256 MiB default) */
+	int      allow_cpu_fallback; /* 0 = strict C7x-only (default); 1 = hybrid C7x + CPU partitioning */
 };
 
 struct c7x_ort_run_stats {
@@ -45,6 +47,10 @@ struct c7x_ort_run_stats {
 	uint64_t dsp_cycles;
 	uint64_t dsp_total_cycles;
 	double   wall_us;
+	uint32_t c7x_subgraphs;
+	uint32_t c7x_nodes;
+	uint32_t cpu_fallback_nodes;
+	double   cpu_fallback_us;
 };
 
 struct c7x_ort_tensor_view {
@@ -58,8 +64,11 @@ struct c7x_ort_tensor_view {
 
 typedef struct c7x_ort_session c7x_ort_session_t;
 
-/* Query whether an ONNX operator type string is supported by the C7x EP. */
+/* Query whether an ONNX operator type string is natively accelerated on C7x. */
 int c7x_ort_ep_op_supported(const char *op_type);
+
+/* Query whether an ONNX operator has a built-in CPU fallback when allow_cpu_fallback=1. */
+int c7x_ort_ep_op_cpu_fallback_supported(const char *op_type);
 
 /* Create a compiled C7x EP session directly from a standard `.onnx` model file. */
 c7x_ort_session_t *c7x_ort_session_create_from_file(const char *onnx_path,
@@ -71,17 +80,21 @@ c7x_ort_session_t *c7x_ort_session_create_from_memory(const void *onnx_bytes, si
 
 void c7x_ort_session_destroy(c7x_ort_session_t *sess);
 
-/* Introspect compiled graph stats and primary input/output metadata. */
+/* Introspect compiled graph stats, hybrid partition summary, and primary IO metadata. */
 uint32_t c7x_ort_session_num_cmds(const c7x_ort_session_t *sess);
+int      c7x_ort_session_partition_info(const c7x_ort_session_t *sess,
+					uint32_t *c7x_subgraphs,
+					uint32_t *c7x_nodes,
+					uint32_t *cpu_nodes);
 int      c7x_ort_session_input_info(const c7x_ort_session_t *sess, size_t idx,
 				    struct c7x_ort_tensor_view *out);
 int      c7x_ort_session_output_info(const c7x_ort_session_t *sess, size_t idx,
 				     struct c7x_ort_tensor_view *out);
 
 /*
- * Run one synchronous inference pass on C7x:
+ * Run one synchronous inference pass (pure C7x single-RPC or hybrid C7x + CPU):
  *   - Copies caller's `inputs[0..n_inputs-1]` into C7x DDR arena
- *   - Executes the compiled command buffer via a single `C7X_OP_EXEC_LIST` RPC
+ *   - Executes compiled C7x command buffers (and any partitioned CPU fallback stages)
  *   - Copies `outputs[0..n_outputs-1]` back to caller buffers
  */
 int c7x_ort_session_run(c7x_ort_session_t *sess,

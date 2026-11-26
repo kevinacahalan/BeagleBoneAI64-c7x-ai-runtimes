@@ -10,11 +10,14 @@
 #include "c7x_rt.h"
 
 #include <algorithm>
+#include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -184,17 +187,47 @@ static void to_c7x_4d_shape_strides(const std::vector<int64_t> &dims, size_t ele
 
 } /* anonymous namespace */
 
+struct CpuNode {
+	std::string              op;
+	std::vector<std::string> inputs;
+	std::string              output;
+	int64_t                  axis = -1;
+	int64_t                  keepdims = 1;
+	std::vector<int64_t>     perm;
+	std::vector<int64_t>     axes;
+	std::vector<float>       scales;
+	std::vector<int32_t>     zps;
+	int32_t                  out_dtype = C7X_ORT_FLOAT;
+	bool                     gelu_tanh = false;
+	float                    clip_min = -std::numeric_limits<float>::infinity();
+	float                    clip_max =  std::numeric_limits<float>::infinity();
+	bool                     resize_linear = false;
+	bool                     resize_align_corners = false;
+};
+
+struct ExecStage {
+	bool         is_cpu = false;
+	c7x_cmdbuf_t *cb = nullptr;
+	CpuNode      cpu;
+};
+
 struct c7x_ort_session {
 	c7x_ctx_t                                        *rt = nullptr;
-	c7x_cmdbuf_t                                     *cb = nullptr;
 	c7x_ort_ep_options                                opts {};
+	std::vector<ExecStage>                            stages;
+	uint32_t                                          total_cmds = 0u;
+	uint32_t                                          n_c7x_subgraphs = 0u;
+	uint32_t                                          n_c7x_nodes = 0u;
+	uint32_t                                          n_cpu_nodes = 0u;
 	std::unordered_map<std::string, CompiledTensor>   tensors;
 	std::vector<c7x_buf_t *>                          aux_bufs;
 	std::vector<std::string>                          input_names;
 	std::vector<std::string>                          output_names;
 
 	~c7x_ort_session() {
-		if (cb) c7x_cmdbuf_destroy(cb);
+		for (auto &st : stages) {
+			if (st.cb) c7x_cmdbuf_destroy(st.cb);
+		}
 		for (auto &kv : tensors) {
 			if (kv.second.owns_buf && kv.second.buf && rt) {
 				c7x_free(rt, kv.second.buf);
@@ -284,41 +317,24 @@ struct c7x_ort_session {
 	}
 };
 
-static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
-	/* Count consumers of every tensor for safe Conv+Relu fusion. */
-	std::unordered_map<std::string, int> use_count;
-	for (const auto &nd : g.nodes) {
-		for (const auto &in : nd.inputs) {
-			if (!in.empty()) use_count[in]++;
-		}
+/* Compile one ONNX node onto `cb` (C7x DSP). Returns true if lowered onto C7x;
+ * returns false cleanly without allocating outputs or pushing commands if unsupported. */
+static bool try_compile_node_c7x(c7x_ort_session *s, c7x_cmdbuf_t *cb,
+				 const c7x_onnx::GraphProto &g, size_t &ni,
+				 const std::unordered_map<std::string, int> &use_count,
+				 bool &pushed_cmd_out) {
+	pushed_cmd_out = false;
+	const auto &nd = g.nodes[ni];
+	const std::string &op = nd.op_type;
+
+	if (!c7x_ort_ep_op_supported(op.c_str()) || nd.inputs.empty() || nd.outputs.empty()) {
+		return false;
 	}
-	for (const auto &out : g.outputs) {
-		use_count[out.name]++;
+	if (nd.outputs[0].empty() || s->tensors.count(nd.outputs[0])) {
+		return false;
 	}
 
-	/* Allocate graph inputs (skipping initializers). */
-	for (const auto &vi : g.inputs) {
-		if (g.initializers.count(vi.name)) continue;
-		if (!s->alloc_tensor(vi.name, vi.elem_type, vi.dims, false)) {
-			fprintf(stderr, "ort-c7x-ep: failed to allocate input '%s'\n", vi.name.c_str());
-			return false;
-		}
-		s->input_names.push_back(vi.name);
-	}
-	for (const auto &vo : g.outputs) {
-		s->output_names.push_back(vo.name);
-	}
-
-	for (size_t ni = 0; ni < g.nodes.size(); ni++) {
-		const auto &nd = g.nodes[ni];
-		const std::string &op = nd.op_type;
-
-		if (!c7x_ort_ep_op_supported(op.c_str())) {
-			fprintf(stderr, "ort-c7x-ep: unsupported ONNX op '%s' (node '%s')\n",
-				op.c_str(), nd.name.c_str());
-			return false;
-		}
-		if (nd.inputs.empty() || nd.outputs.empty()) return false;
+	{
 
 		/* ---------- Zero-copy shape ops ---------- */
 		if (op == "Reshape" || op == "Flatten" || op == "Squeeze" || op == "Unsqueeze") {
@@ -396,8 +412,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 					}
 				}
 			}
-			if (!s->alias_tensor(nd.outputs[0], *in, new_dims)) return false;
-			continue;
+			return s->alias_tensor(nd.outputs[0], *in, new_dims) != nullptr;
 		}
 
 		/* ---------- Standalone DequantizeLinear (INT8/UINT8 -> FP32, tensor or per-axis) ---------- */
@@ -457,7 +472,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			CompiledTensor *y = s->alloc_tensor(nd.outputs[0], C7X_ORT_FLOAT, x->dims, false);
 			if (!y) return false;
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &dd, sizeof(dd));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &dd, sizeof(dd));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op    = C7X_CMD_DEQUANTIZE_LIN;
@@ -467,8 +482,9 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src2  = b_zp ? c7x_buf_phys(b_zp) : 0ull;
 			cmd.src3  = dp;
 			cmd.dst   = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- QLinearConv (strict ONNX semantics: always requantizes to y_dtype) ---------- */
@@ -610,7 +626,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cd.b_sum_addr    = bsum_phys;
 			cd.b_scales_addr = c7x_buf_phys(b_ws);
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &cd, sizeof(cd));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &cd, sizeof(cd));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op    = C7X_CMD_QLINEAR_CONV2D;
@@ -620,8 +636,9 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src2  = bias_phys;
 			cmd.src3  = dp;
 			cmd.dst   = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- QLinearMatMul (strict ONNX semantics) ---------- */
@@ -702,7 +719,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			md.b_sum_addr    = c7x_buf_phys(b_w) + bsum_off;
 			md.b_scales_addr = c7x_buf_phys(b_s);
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &md, sizeof(md));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &md, sizeof(md));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op    = C7X_CMD_QLINEAR_MATMUL;
@@ -711,8 +728,9 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src1  = c7x_buf_phys(a->buf);
 			cmd.src3  = dp;
 			cmd.dst   = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- FP32 Conv (with optional bias & exact fused Relu) ---------- */
@@ -747,7 +765,8 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 
 			uint32_t flags = 0u;
 			std::string out_name = nd.outputs[0];
-			if (ni + 1 < g.nodes.size() && use_count[out_name] == 1 &&
+			auto uc_it = use_count.find(out_name);
+			if (ni + 1 < g.nodes.size() && uc_it != use_count.end() && uc_it->second == 1 &&
 			    g.nodes[ni + 1].op_type == "Relu" && g.nodes[ni + 1].inputs[0] == out_name) {
 				flags |= C7X_CMD_FLAG_RELU;
 				out_name = g.nodes[ni + 1].outputs[0];
@@ -771,7 +790,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cd.dst_nb[2] = (uint64_t)OH * OW * sizeof(float);
 			cd.dst_nb[3] = (uint64_t)OC * OH * OW * sizeof(float);
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &cd, sizeof(cd));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &cd, sizeof(cd));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op    = C7X_CMD_CONV_2D_F32;
@@ -781,8 +800,9 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src2  = b ? c7x_buf_phys(b->buf) : 0ull;
 			cmd.src3  = dp;
 			cmd.dst   = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- FP32 Gemm / MatMul ---------- */
@@ -842,7 +862,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			md.nb1[0] = 4u; md.nb1[1] = (uint64_t)K * 4u; md.nb1[2] = (uint64_t)M * K * 4u; md.nb1[3] = md.nb1[2];
 			md.nb_dst[0] = 4u; md.nb_dst[1] = (uint64_t)N * 4u; md.nb_dst[2] = (uint64_t)M * N * 4u; md.nb_dst[3] = md.nb_dst[2];
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &md, sizeof(md));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &md, sizeof(md));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op   = C7X_CMD_MATMUL_F32;
@@ -850,7 +870,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src1 = c7x_buf_phys(a->buf);
 			cmd.src3 = dp;
 			cmd.dst  = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
 
 			if (op == "Gemm" && nd.inputs.size() >= 3u && !nd.inputs[2].empty()) {
 				CompiledTensor *c = s->ensure_initializer_tensor(g, nd.inputs[2]);
@@ -862,7 +882,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 				for (int i = 0; i < 4; i++) {
 					if (bd.ne1[i] != bd.ne0[i] && bd.ne1[i] != 1u) return false;
 				}
-				uint64_t bdp = c7x_cmdbuf_push_desc(s->cb, &bd, sizeof(bd));
+				uint64_t bdp = c7x_cmdbuf_push_desc(cb, &bd, sizeof(bd));
 				if (!bdp) return false;
 				struct c7x_cmd acmd {};
 				acmd.op   = C7X_CMD_ADD_F32;
@@ -870,9 +890,10 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 				acmd.src1 = c7x_buf_phys(c->buf);
 				acmd.src3 = bdp;
 				acmd.dst  = c7x_buf_phys(y->buf);
-				if (c7x_cmdbuf_push(s->cb, &acmd) != 0) return false;
+				if (c7x_cmdbuf_push(cb, &acmd) != 0) return false;
 			}
-			continue;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- LayerNormalization ---------- */
@@ -900,7 +921,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			ndesc.has_gamma = gamma ? 1u : 0u;
 			ndesc.has_beta  = beta ? 1u : 0u;
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &ndesc, sizeof(ndesc));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &ndesc, sizeof(ndesc));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op   = C7X_CMD_NORM_F32;
@@ -909,8 +930,9 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src2 = beta  ? c7x_buf_phys(beta->buf)  : 0ull;
 			cmd.src3 = dp;
 			cmd.dst  = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- Pooling (MaxPool, AveragePool, GlobalAveragePool) ---------- */
@@ -963,15 +985,16 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			pd.dst_nb1  = (uint64_t)OW * sizeof(float);
 			pd.dst_nb2  = (uint64_t)OH * OW * sizeof(float);
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &pd, sizeof(pd));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &pd, sizeof(pd));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op   = C7X_CMD_POOL_2D_F32;
 			cmd.src0 = c7x_buf_phys(x->buf);
 			cmd.src3 = dp;
 			cmd.dst  = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- Elementwise Unary (Relu, Gelu, Sigmoid, Tanh) ---------- */
@@ -997,8 +1020,9 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.p1   = subop;
 			cmd.src0 = c7x_buf_phys(x->buf);
 			cmd.dst  = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
 		/* ---------- Elementwise Binary (Add, Mul; handles commuted broadcast) ---------- */
@@ -1038,7 +1062,7 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			to_c7x_4d_shape_strides(b->dims, 4u, bd.ne1, bd.nb1);
 			to_c7x_4d_shape_strides(y->dims, 4u, bd.ne_dst, bd.nb_dst);
 
-			uint64_t dp = c7x_cmdbuf_push_desc(s->cb, &bd, sizeof(bd));
+			uint64_t dp = c7x_cmdbuf_push_desc(cb, &bd, sizeof(bd));
 			if (!dp) return false;
 			struct c7x_cmd cmd {};
 			cmd.op   = (op == "Mul") ? C7X_CMD_MUL_F32 : C7X_CMD_ADD_F32;
@@ -1046,14 +1070,577 @@ static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
 			cmd.src1 = c7x_buf_phys(b->buf);
 			cmd.src3 = dp;
 			cmd.dst  = c7x_buf_phys(y->buf);
-			if (c7x_cmdbuf_push(s->cb, &cmd) != 0) return false;
-			continue;
+			if (c7x_cmdbuf_push(cb, &cmd) != 0) return false;
+			pushed_cmd_out = true;
+			return true;
 		}
 
-		fprintf(stderr, "ort-c7x-ep: unhandled op '%s' (node '%s')\n",
-			op.c_str(), nd.name.c_str());
 		return false;
 	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Built-in CPU fallback compiler & runner (active when allow_cpu_fallback=1) */
+/* -------------------------------------------------------------------------- */
+
+static int32_t round_nearest_even_i32(float v) {
+	int prev = std::fegetround();
+	std::fesetround(FE_TONEAREST);
+	float r = std::nearbyintf(v);
+	std::fesetround(prev);
+	if (r >= 2147483647.0f) return 2147483647;
+	if (r <= -2147483648.0f) return -2147483647 - 1;
+	return (int32_t)r;
+}
+
+static bool try_compile_node_cpu(c7x_ort_session *s, const c7x_onnx::GraphProto &g,
+				 const c7x_onnx::NodeProto &nd, CpuNode &out) {
+	const std::string &op = nd.op_type;
+	if (!c7x_ort_ep_op_cpu_fallback_supported(op.c_str()) || nd.inputs.empty() || nd.outputs.empty()) {
+		return false;
+	}
+	if (nd.outputs[0].empty() || s->tensors.count(nd.outputs[0])) {
+		return false;
+	}
+
+	out = CpuNode{};
+	out.op     = op;
+	out.output = nd.outputs[0];
+
+	if (op == "QuantizeLinear") {
+		if (nd.inputs.size() < 2u) return false;
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dtype != C7X_ORT_FLOAT) return false;
+		if (!read_vec_f32(g, nd.inputs[1], out.scales, true)) return false;
+		out.out_dtype = C7X_ORT_UINT8;
+		out.zps.assign(out.scales.size(), 0);
+		if (nd.inputs.size() >= 3u && !nd.inputs[2].empty()) {
+			auto zit = g.initializers.find(nd.inputs[2]);
+			if (zit == g.initializers.end()) return false;
+			if (zit->second.data_type != C7X_ORT_UINT8 && zit->second.data_type != C7X_ORT_INT8) return false;
+			auto zb = zit->second.as_bytes();
+			if (!validate_tensor_bytes(zit->second, zb) || zb.size() != out.scales.size()) return false;
+			out.out_dtype = zit->second.data_type;
+			for (size_t i = 0; i < zb.size(); i++) {
+				out.zps[i] = (out.out_dtype == C7X_ORT_UINT8) ? (int32_t)zb[i] : (int32_t)(int8_t)zb[i];
+			}
+		}
+		if (out.scales.size() > 1u) {
+			int64_t axis = nd.get_int("axis", 1);
+			if (axis < 0) axis += (int64_t)x->dims.size();
+			if (axis < 0 || axis >= (int64_t)x->dims.size() ||
+			    (size_t)x->dims[axis] != out.scales.size()) return false;
+			out.axis = axis;
+		} else {
+			out.axis = -1;
+		}
+		out.inputs = { x->name };
+		return s->alloc_tensor(out.output, out.out_dtype, x->dims, false) != nullptr;
+	}
+
+	if (op == "Softmax") {
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dtype != C7X_ORT_FLOAT || x->dims.empty()) return false;
+		int64_t axis = nd.get_int("axis", -1);
+		if (axis < 0) axis += (int64_t)x->dims.size();
+		if (axis < 0 || axis >= (int64_t)x->dims.size()) return false;
+		out.axis   = axis;
+		out.inputs = { x->name };
+		return s->alloc_tensor(out.output, C7X_ORT_FLOAT, x->dims, false) != nullptr;
+	}
+
+	if (op == "Gelu") {
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dtype != C7X_ORT_FLOAT) return false;
+		std::string approx = nd.get_str("approximate", "none");
+		if (approx != "none" && approx != "tanh") return false;
+		out.gelu_tanh = (approx == "tanh");
+		out.inputs    = { x->name };
+		return s->alloc_tensor(out.output, C7X_ORT_FLOAT, x->dims, false) != nullptr;
+	}
+
+	if (op == "Clip") {
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dtype != C7X_ORT_FLOAT) return false;
+		out.clip_min = nd.get_float("min", -std::numeric_limits<float>::infinity());
+		out.clip_max = nd.get_float("max",  std::numeric_limits<float>::infinity());
+		if (nd.inputs.size() >= 2u && !nd.inputs[1].empty()) {
+			if (!read_scalar_f32(g, nd.inputs[1], out.clip_min)) return false;
+		}
+		if (nd.inputs.size() >= 3u && !nd.inputs[2].empty()) {
+			if (!read_scalar_f32(g, nd.inputs[2], out.clip_max)) return false;
+		}
+		out.inputs = { x->name };
+		return s->alloc_tensor(out.output, C7X_ORT_FLOAT, x->dims, false) != nullptr;
+	}
+
+	if (op == "Add" || op == "Sub" || op == "Mul" || op == "Div") {
+		if (nd.inputs.size() < 2u) return false;
+		CompiledTensor *a = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		CompiledTensor *b = s->ensure_initializer_tensor(g, nd.inputs[1]);
+		if (!a || !b || a->dtype != C7X_ORT_FLOAT || b->dtype != C7X_ORT_FLOAT) return false;
+		size_t nd_out = std::max(a->dims.size(), b->dims.size());
+		if (nd_out > 4u) return false;
+		std::vector<int64_t> out_dims(nd_out, 1);
+		for (size_t i = 0; i < nd_out; i++) {
+			int64_t da = (i < a->dims.size()) ? a->dims[a->dims.size() - 1 - i] : 1;
+			int64_t db = (i < b->dims.size()) ? b->dims[b->dims.size() - 1 - i] : 1;
+			if (da != db && da != 1 && db != 1) return false;
+			out_dims[nd_out - 1 - i] = std::max(da, db);
+		}
+		out.inputs = { a->name, b->name };
+		return s->alloc_tensor(out.output, C7X_ORT_FLOAT, out_dims, false) != nullptr;
+	}
+
+	if (op == "Transpose") {
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dims.empty() || x->dims.size() > 4u) return false;
+		size_t ndim = x->dims.size();
+		out.perm = nd.get_ints("perm");
+		if (out.perm.empty()) {
+			for (size_t i = 0; i < ndim; i++) out.perm.push_back((int64_t)(ndim - 1 - i));
+		}
+		if (out.perm.size() != ndim) return false;
+		std::vector<bool> seen(ndim, false);
+		std::vector<int64_t> out_dims(ndim, 0);
+		for (size_t i = 0; i < ndim; i++) {
+			if (out.perm[i] < 0 || (size_t)out.perm[i] >= ndim || seen[(size_t)out.perm[i]]) return false;
+			seen[(size_t)out.perm[i]] = true;
+			out_dims[i] = x->dims[(size_t)out.perm[i]];
+		}
+		out.inputs = { x->name };
+		return s->alloc_tensor(out.output, x->dtype, out_dims, false) != nullptr;
+	}
+
+	if (op == "Concat") {
+		if (nd.inputs.empty()) return false;
+		CompiledTensor *first = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!first || first->dims.empty() || first->dims.size() > 4u) return false;
+		int64_t axis = nd.get_int("axis", 0);
+		if (axis < 0) axis += (int64_t)first->dims.size();
+		if (axis < 0 || axis >= (int64_t)first->dims.size()) return false;
+		std::vector<int64_t> out_dims = first->dims;
+		out_dims[(size_t)axis] = 0;
+		for (const auto &iname : nd.inputs) {
+			CompiledTensor *t = s->ensure_initializer_tensor(g, iname);
+			if (!t || t->dtype != first->dtype || t->dims.size() != first->dims.size()) return false;
+			for (size_t d = 0; d < t->dims.size(); d++) {
+				if ((int64_t)d != axis && t->dims[d] != first->dims[d]) return false;
+			}
+			out_dims[(size_t)axis] += t->dims[(size_t)axis];
+			out.inputs.push_back(t->name);
+		}
+		out.axis = axis;
+		return s->alloc_tensor(out.output, first->dtype, out_dims, false) != nullptr;
+	}
+
+	if (op == "ReduceMean") {
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dtype != C7X_ORT_FLOAT || x->dims.empty() || x->dims.size() > 4u) return false;
+		std::vector<int64_t> axes;
+		if (nd.inputs.size() >= 2u && !nd.inputs[1].empty()) {
+			if (!read_vec_i64(g, nd.inputs[1], axes)) return false;
+		} else {
+			axes = nd.get_ints("axes");
+		}
+		if (axes.empty()) {
+			for (size_t i = 0; i < x->dims.size(); i++) axes.push_back((int64_t)i);
+		}
+		out.keepdims = nd.get_int("keepdims", 1);
+		std::vector<bool> reduced(x->dims.size(), false);
+		for (int64_t a : axes) {
+			if (a < 0) a += (int64_t)x->dims.size();
+			if (a < 0 || (size_t)a >= x->dims.size()) return false;
+			reduced[(size_t)a] = true;
+		}
+		std::vector<int64_t> out_dims;
+		for (size_t i = 0; i < x->dims.size(); i++) {
+			if (reduced[i]) {
+				out.axes.push_back((int64_t)i);
+				if (out.keepdims) out_dims.push_back(1);
+			} else {
+				out_dims.push_back(x->dims[i]);
+			}
+		}
+		if (out_dims.empty()) out_dims.push_back(1);
+		out.inputs = { x->name };
+		return s->alloc_tensor(out.output, C7X_ORT_FLOAT, out_dims, false) != nullptr;
+	}
+
+	if (op == "Resize") {
+		CompiledTensor *x = s->ensure_initializer_tensor(g, nd.inputs[0]);
+		if (!x || x->dtype != C7X_ORT_FLOAT || x->dims.size() != 4u) return false;
+		std::string mode = nd.get_str("mode", "nearest");
+		if (mode != "nearest" && mode != "linear") return false;
+		std::string ctm = nd.get_str("coordinate_transformation_mode", "half_pixel");
+		if (ctm != "half_pixel" && ctm != "asymmetric" && ctm != "align_corners") return false;
+		out.resize_linear = (mode == "linear");
+		out.resize_align_corners = (ctm == "align_corners");
+
+		std::vector<int64_t> out_dims = x->dims;
+		if (nd.inputs.size() >= 4u && !nd.inputs[3].empty()) {
+			std::vector<int64_t> sizes;
+			if (!read_vec_i64(g, nd.inputs[3], sizes) || sizes.size() != 4u) return false;
+			if (sizes[0] != x->dims[0] || sizes[1] != x->dims[1] || sizes[2] <= 0 || sizes[3] <= 0) return false;
+			out_dims = sizes;
+		} else if (nd.inputs.size() >= 3u && !nd.inputs[2].empty()) {
+			std::vector<float> sc;
+			if (!read_vec_f32(g, nd.inputs[2], sc, true) || sc.size() != 4u) return false;
+			out_dims[2] = (int64_t)std::floor((float)x->dims[2] * sc[2]);
+			out_dims[3] = (int64_t)std::floor((float)x->dims[3] * sc[3]);
+			if (out_dims[2] <= 0 || out_dims[3] <= 0) return false;
+		} else {
+			return false;
+		}
+		out.inputs = { x->name };
+		return s->alloc_tensor(out.output, C7X_ORT_FLOAT, out_dims, false) != nullptr;
+	}
+
+	return false;
+}
+
+static bool run_cpu_node(c7x_ort_session *s, const CpuNode &cn) {
+	auto oit = s->tensors.find(cn.output);
+	if (oit == s->tensors.end()) return false;
+	const CompiledTensor &y = oit->second;
+
+	if (cn.op == "QuantizeLinear") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		std::vector<float> in(x.num_elements());
+		c7x_read(s->rt, in.data(), x.buf, 0u, x.nbytes);
+		std::vector<uint8_t> out(y.nbytes);
+		size_t outer = 1u, axis_dim = 1u, inner = x.num_elements();
+		if (cn.axis >= 0) {
+			outer = 1u; inner = 1u;
+			for (int64_t i = 0; i < cn.axis; i++) outer *= (size_t)x.dims[(size_t)i];
+			axis_dim = (size_t)x.dims[(size_t)cn.axis];
+			for (size_t i = (size_t)cn.axis + 1u; i < x.dims.size(); i++) inner *= (size_t)x.dims[i];
+		}
+		int32_t qmin = (y.dtype == C7X_ORT_UINT8) ? 0 : -128;
+		int32_t qmax = (y.dtype == C7X_ORT_UINT8) ? 255 : 127;
+		for (size_t o = 0; o < outer; o++) {
+			for (size_t a = 0; a < axis_dim; a++) {
+				float inv_sc = 1.0f / cn.scales[a];
+				int32_t zp = cn.zps[a];
+				size_t base = (o * axis_dim + a) * inner;
+				for (size_t i = 0; i < inner; i++) {
+					int32_t q = round_nearest_even_i32(in[base + i] * inv_sc) + zp;
+					if (q < qmin) q = qmin;
+					if (q > qmax) q = qmax;
+					out[base + i] = (uint8_t)(y.dtype == C7X_ORT_UINT8 ? q : (int8_t)q);
+				}
+			}
+		}
+		c7x_write(s->rt, y.buf, 0u, out.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Softmax") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		std::vector<float> in(x.num_elements()), out(x.num_elements());
+		c7x_read(s->rt, in.data(), x.buf, 0u, x.nbytes);
+		size_t outer = 1u, axis_dim = (size_t)x.dims[(size_t)cn.axis], inner = 1u;
+		for (int64_t i = 0; i < cn.axis; i++) outer *= (size_t)x.dims[(size_t)i];
+		for (size_t i = (size_t)cn.axis + 1u; i < x.dims.size(); i++) inner *= (size_t)x.dims[i];
+		for (size_t o = 0; o < outer; o++) {
+			for (size_t i = 0; i < inner; i++) {
+				float mx = -std::numeric_limits<float>::infinity();
+				for (size_t a = 0; a < axis_dim; a++) {
+					float v = in[(o * axis_dim + a) * inner + i];
+					if (v > mx) mx = v;
+				}
+				double sum = 0.0;
+				for (size_t a = 0; a < axis_dim; a++) {
+					float e = std::exp(in[(o * axis_dim + a) * inner + i] - mx);
+					out[(o * axis_dim + a) * inner + i] = e;
+					sum += (double)e;
+				}
+				float inv = (sum > 0.0) ? (float)(1.0 / sum) : 0.0f;
+				for (size_t a = 0; a < axis_dim; a++) {
+					out[(o * axis_dim + a) * inner + i] *= inv;
+				}
+			}
+		}
+		c7x_write(s->rt, y.buf, 0u, out.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Gelu") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		std::vector<float> v(x.num_elements());
+		c7x_read(s->rt, v.data(), x.buf, 0u, x.nbytes);
+		if (cn.gelu_tanh) {
+			for (float &e : v) {
+				e = 0.5f * e * (1.0f + std::tanh(0.7978845608f * (e + 0.044715f * e * e * e)));
+			}
+		} else {
+			for (float &e : v) {
+				e = 0.5f * e * (1.0f + std::erff(e * 0.7071067811865475244f));
+			}
+		}
+		c7x_write(s->rt, y.buf, 0u, v.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Clip") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		std::vector<float> v(x.num_elements());
+		c7x_read(s->rt, v.data(), x.buf, 0u, x.nbytes);
+		for (float &e : v) {
+			if (e < cn.clip_min) e = cn.clip_min;
+			if (e > cn.clip_max) e = cn.clip_max;
+		}
+		c7x_write(s->rt, y.buf, 0u, v.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Add" || cn.op == "Sub" || cn.op == "Mul" || cn.op == "Div") {
+		const CompiledTensor &a = s->tensors.at(cn.inputs[0]);
+		const CompiledTensor &b = s->tensors.at(cn.inputs[1]);
+		std::vector<float> va(a.num_elements()), vb(b.num_elements()), vo(y.num_elements());
+		c7x_read(s->rt, va.data(), a.buf, 0u, a.nbytes);
+		c7x_read(s->rt, vb.data(), b.buf, 0u, b.nbytes);
+		uint32_t nea[4], neb[4], neo[4];
+		uint64_t nba[4], nbb[4], nbo[4];
+		to_c7x_4d_shape_strides(a.dims, 1u, nea, nba);
+		to_c7x_4d_shape_strides(b.dims, 1u, neb, nbb);
+		to_c7x_4d_shape_strides(y.dims, 1u, neo, nbo);
+		for (uint32_t i3 = 0; i3 < neo[3]; i3++) {
+			for (uint32_t i2 = 0; i2 < neo[2]; i2++) {
+				for (uint32_t i1 = 0; i1 < neo[1]; i1++) {
+					for (uint32_t i0 = 0; i0 < neo[0]; i0++) {
+						size_t ia = (size_t)((i3 % nea[3]) * nba[3] + (i2 % nea[2]) * nba[2] +
+								     (i1 % nea[1]) * nba[1] + (i0 % nea[0]) * nba[0]);
+						size_t ib = (size_t)((i3 % neb[3]) * nbb[3] + (i2 % neb[2]) * nbb[2] +
+								     (i1 % neb[1]) * nbb[1] + (i0 % neb[0]) * nbb[0]);
+						size_t io = (size_t)(i3 * nbo[3] + i2 * nbo[2] + i1 * nbo[1] + i0 * nbo[0]);
+						if (cn.op == "Add")      vo[io] = va[ia] + vb[ib];
+						else if (cn.op == "Sub") vo[io] = va[ia] - vb[ib];
+						else if (cn.op == "Mul") vo[io] = va[ia] * vb[ib];
+						else                     vo[io] = va[ia] / vb[ib];
+					}
+				}
+			}
+		}
+		c7x_write(s->rt, y.buf, 0u, vo.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Transpose") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		size_t esz = dtype_size(x.dtype);
+		std::vector<uint8_t> in(x.nbytes), out(y.nbytes);
+		c7x_read(s->rt, in.data(), x.buf, 0u, x.nbytes);
+		size_t ndim = x.dims.size();
+		std::vector<size_t> in_str(ndim, 1u), out_str(ndim, 1u);
+		for (int i = (int)ndim - 2; i >= 0; i--) {
+			in_str[(size_t)i]  = in_str[(size_t)i + 1u]  * (size_t)x.dims[(size_t)i + 1u];
+			out_str[(size_t)i] = out_str[(size_t)i + 1u] * (size_t)y.dims[(size_t)i + 1u];
+		}
+		size_t total = y.num_elements();
+		for (size_t oi = 0; oi < total; oi++) {
+			size_t rem = oi, ii = 0;
+			for (size_t d = 0; d < ndim; d++) {
+				size_t coord = rem / out_str[d];
+				rem %= out_str[d];
+				ii += coord * in_str[(size_t)cn.perm[d]];
+			}
+			std::memcpy(out.data() + oi * esz, in.data() + ii * esz, esz);
+		}
+		c7x_write(s->rt, y.buf, 0u, out.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Concat") {
+		size_t esz = dtype_size(y.dtype);
+		std::vector<uint8_t> out(y.nbytes);
+		size_t outer = 1u, inner = 1u;
+		for (int64_t i = 0; i < cn.axis; i++) outer *= (size_t)y.dims[(size_t)i];
+		for (size_t i = (size_t)cn.axis + 1u; i < y.dims.size(); i++) inner *= (size_t)y.dims[i];
+		size_t out_axis = (size_t)y.dims[(size_t)cn.axis];
+		size_t axis_off = 0u;
+		for (const auto &iname : cn.inputs) {
+			const CompiledTensor &t = s->tensors.at(iname);
+			std::vector<uint8_t> tb(t.nbytes);
+			c7x_read(s->rt, tb.data(), t.buf, 0u, t.nbytes);
+			size_t t_axis = (size_t)t.dims[(size_t)cn.axis];
+			size_t chunk = t_axis * inner * esz;
+			for (size_t o = 0; o < outer; o++) {
+				std::memcpy(out.data() + ((o * out_axis + axis_off) * inner) * esz,
+					    tb.data()  + (o * t_axis * inner) * esz, chunk);
+			}
+			axis_off += t_axis;
+		}
+		c7x_write(s->rt, y.buf, 0u, out.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "ReduceMean") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		std::vector<float> in(x.num_elements()), out(y.num_elements(), 0.0f);
+		c7x_read(s->rt, in.data(), x.buf, 0u, x.nbytes);
+		size_t ndim = x.dims.size();
+		std::vector<bool> red(ndim, false);
+		size_t denom = 1u;
+		for (int64_t a : cn.axes) {
+			red[(size_t)a] = true;
+			denom *= (size_t)x.dims[(size_t)a];
+		}
+		std::vector<size_t> in_str(ndim, 1u);
+		for (int i = (int)ndim - 2; i >= 0; i--) {
+			in_str[(size_t)i] = in_str[(size_t)i + 1u] * (size_t)x.dims[(size_t)i + 1u];
+		}
+		std::vector<size_t> out_str(y.dims.size(), 1u);
+		for (int i = (int)y.dims.size() - 2; i >= 0; i--) {
+			out_str[(size_t)i] = out_str[(size_t)i + 1u] * (size_t)y.dims[(size_t)i + 1u];
+		}
+		size_t total = x.num_elements();
+		for (size_t ii = 0; ii < total; ii++) {
+			size_t rem = ii, oi = 0, od = 0;
+			for (size_t d = 0; d < ndim; d++) {
+				size_t c = rem / in_str[d];
+				rem %= in_str[d];
+				if (red[d]) {
+					if (cn.keepdims) od++;
+				} else {
+					oi += c * out_str[od++];
+				}
+			}
+			out[oi] += in[ii];
+		}
+		float inv = 1.0f / (float)denom;
+		for (float &v : out) v *= inv;
+		c7x_write(s->rt, y.buf, 0u, out.data(), y.nbytes);
+		return true;
+	}
+
+	if (cn.op == "Resize") {
+		const CompiledTensor &x = s->tensors.at(cn.inputs[0]);
+		std::vector<float> in(x.num_elements()), out(y.num_elements());
+		c7x_read(s->rt, in.data(), x.buf, 0u, x.nbytes);
+		size_t N = (size_t)x.dims[0], C = (size_t)x.dims[1];
+		size_t IH = (size_t)x.dims[2], IW = (size_t)x.dims[3];
+		size_t OH = (size_t)y.dims[2], OW = (size_t)y.dims[3];
+		auto map_coord = [&](size_t o, size_t in_sz, size_t out_sz) -> float {
+			if (cn.resize_align_corners && out_sz > 1u) {
+				return (float)o * (float)(in_sz - 1u) / (float)(out_sz - 1u);
+			}
+			return ((float)o + 0.5f) * ((float)in_sz / (float)out_sz) - 0.5f;
+		};
+		for (size_t n = 0; n < N; n++) {
+			for (size_t c = 0; c < C; c++) {
+				const float *ip = in.data() + (n * C + c) * IH * IW;
+				float       *op = out.data() + (n * C + c) * OH * OW;
+				for (size_t oy = 0; oy < OH; oy++) {
+					float fy = map_coord(oy, IH, OH);
+					for (size_t ox = 0; ox < OW; ox++) {
+						float fx = map_coord(ox, IW, OW);
+						if (!cn.resize_linear) {
+							int sy = (int)std::floor(fy + 0.5f);
+							int sx = (int)std::floor(fx + 0.5f);
+							sy = std::max(0, std::min((int)IH - 1, sy));
+							sx = std::max(0, std::min((int)IW - 1, sx));
+							op[oy * OW + ox] = ip[(size_t)sy * IW + (size_t)sx];
+						} else {
+							fy = std::max(0.0f, std::min((float)(IH - 1u), fy));
+							fx = std::max(0.0f, std::min((float)(IW - 1u), fx));
+							int y0 = (int)std::floor(fy), y1 = std::min((int)IH - 1, y0 + 1);
+							int x0 = (int)std::floor(fx), x1 = std::min((int)IW - 1, x0 + 1);
+							float wy = fy - (float)y0, wx = fx - (float)x0;
+							float v00 = ip[(size_t)y0 * IW + (size_t)x0];
+							float v01 = ip[(size_t)y0 * IW + (size_t)x1];
+							float v10 = ip[(size_t)y1 * IW + (size_t)x0];
+							float v11 = ip[(size_t)y1 * IW + (size_t)x1];
+							op[oy * OW + ox] = (1.0f - wy) * ((1.0f - wx) * v00 + wx * v01) +
+									   wy * ((1.0f - wx) * v10 + wx * v11);
+						}
+					}
+				}
+			}
+		}
+		c7x_write(s->rt, y.buf, 0u, out.data(), y.nbytes);
+		return true;
+	}
+
+	return false;
+}
+
+static bool compile_graph(c7x_ort_session *s, const c7x_onnx::GraphProto &g) {
+	/* Count consumers of every tensor for safe Conv+Relu fusion. */
+	std::unordered_map<std::string, int> use_count;
+	for (const auto &nd : g.nodes) {
+		for (const auto &in : nd.inputs) {
+			if (!in.empty()) use_count[in]++;
+		}
+	}
+	for (const auto &out : g.outputs) {
+		use_count[out.name]++;
+	}
+
+	/* Allocate graph inputs (skipping initializers). */
+	for (const auto &vi : g.inputs) {
+		if (g.initializers.count(vi.name)) continue;
+		if (!s->alloc_tensor(vi.name, vi.elem_type, vi.dims, false)) {
+			fprintf(stderr, "ort-c7x-ep: failed to allocate input '%s'\n", vi.name.c_str());
+			return false;
+		}
+		s->input_names.push_back(vi.name);
+	}
+	for (const auto &vo : g.outputs) {
+		s->output_names.push_back(vo.name);
+	}
+
+	c7x_cmdbuf_t *cur_cb = nullptr;
+	auto flush_c7x_stage = [&]() {
+		if (cur_cb) {
+			uint32_t cnt = c7x_cmdbuf_count(cur_cb);
+			if (cnt > 0u) {
+				ExecStage st {};
+				st.is_cpu = false;
+				st.cb     = cur_cb;
+				s->stages.push_back(std::move(st));
+				s->n_c7x_subgraphs++;
+				s->total_cmds += cnt;
+			} else {
+				c7x_cmdbuf_destroy(cur_cb);
+			}
+			cur_cb = nullptr;
+		}
+	};
+
+	for (size_t ni = 0; ni < g.nodes.size(); ni++) {
+		if (!cur_cb) {
+			cur_cb = c7x_cmdbuf_create(s->rt, 1024u, 256u * 1024u);
+			if (!cur_cb) return false;
+		}
+		bool pushed = false;
+		size_t saved_ni = ni;
+		if (try_compile_node_c7x(s, cur_cb, g, ni, use_count, pushed)) {
+			if (pushed) s->n_c7x_nodes++;
+			continue;
+		}
+		ni = saved_ni;
+
+		if (!s->opts.allow_cpu_fallback) {
+			fprintf(stderr, "ort-c7x-ep: unsupported ONNX op '%s' (node '%s'); set allow_cpu_fallback=1 for hybrid execution\n",
+				g.nodes[ni].op_type.c_str(), g.nodes[ni].name.c_str());
+			flush_c7x_stage();
+			return false;
+		}
+
+		flush_c7x_stage();
+		ExecStage cpu_st {};
+		cpu_st.is_cpu = true;
+		if (!try_compile_node_cpu(s, g, g.nodes[ni], cpu_st.cpu)) {
+			fprintf(stderr, "ort-c7x-ep: unsupported ONNX op '%s' (node '%s') even with CPU fallback\n",
+				g.nodes[ni].op_type.c_str(), g.nodes[ni].name.c_str());
+			return false;
+		}
+		s->stages.push_back(std::move(cpu_st));
+		s->n_cpu_nodes++;
+	}
+
+	flush_c7x_stage();
 	return true;
 }
 
@@ -1075,6 +1662,19 @@ int c7x_ort_ep_op_supported(const char *op_type) {
 	return 0;
 }
 
+int c7x_ort_ep_op_cpu_fallback_supported(const char *op_type) {
+	if (!op_type) return 0;
+	static const char *const kCpuOps[] = {
+		"QuantizeLinear", "Softmax", "Gelu", "Clip",
+		"Sub", "Div", "Add", "Mul",
+		"Transpose", "Concat", "ReduceMean", "Resize",
+	};
+	for (const char *k : kCpuOps) {
+		if (std::strcmp(op_type, k) == 0) return 1;
+	}
+	return 0;
+}
+
 c7x_ort_session_t *c7x_ort_session_create_from_memory(const void *onnx_bytes, size_t onnx_len,
 						      const struct c7x_ort_ep_options *opts) {
 	if (!onnx_bytes || onnx_len == 0u) return nullptr;
@@ -1088,10 +1688,11 @@ c7x_ort_session_t *c7x_ort_session_create_from_memory(const void *onnx_bytes, si
 	if (opts) {
 		sess->opts = *opts;
 	} else {
-		sess->opts.use_msmc_weights = 1;
-		sess->opts.enable_profiling = 0;
-		sess->opts.force_hostemu    = 0;
-		sess->opts.emu_ddr_bytes    = 0u;
+		sess->opts.use_msmc_weights   = 1;
+		sess->opts.enable_profiling   = 0;
+		sess->opts.force_hostemu      = 0;
+		sess->opts.emu_ddr_bytes      = 0u;
+		sess->opts.allow_cpu_fallback = 0;
 	}
 
 	struct c7x_open_opts ro {};
@@ -1100,11 +1701,6 @@ c7x_ort_session_t *c7x_ort_session_create_from_memory(const void *onnx_bytes, si
 	sess->rt = c7x_open(&ro);
 	if (!sess->rt) {
 		fprintf(stderr, "ort-c7x-ep: c7x_open failed\n");
-		return nullptr;
-	}
-	sess->cb = c7x_cmdbuf_create(sess->rt, 1024u, 256u * 1024u);
-	if (!sess->cb) {
-		fprintf(stderr, "ort-c7x-ep: c7x_cmdbuf_create failed\n");
 		return nullptr;
 	}
 	if (!compile_graph(sess.get(), model.graph)) {
@@ -1134,7 +1730,18 @@ void c7x_ort_session_destroy(c7x_ort_session_t *sess) {
 }
 
 uint32_t c7x_ort_session_num_cmds(const c7x_ort_session_t *sess) {
-	return (sess && sess->cb) ? c7x_cmdbuf_count(sess->cb) : 0u;
+	return sess ? sess->total_cmds : 0u;
+}
+
+int c7x_ort_session_partition_info(const c7x_ort_session_t *sess,
+				   uint32_t *c7x_subgraphs,
+				   uint32_t *c7x_nodes,
+				   uint32_t *cpu_nodes) {
+	if (!sess) return -1;
+	if (c7x_subgraphs) *c7x_subgraphs = sess->n_c7x_subgraphs;
+	if (c7x_nodes)     *c7x_nodes     = sess->n_c7x_nodes;
+	if (cpu_nodes)     *cpu_nodes     = sess->n_cpu_nodes;
+	return 0;
 }
 
 static int fill_tensor_view(const c7x_ort_session_t *sess, const std::string &name,
@@ -1167,7 +1774,8 @@ int c7x_ort_session_run(c7x_ort_session_t *sess,
 			const struct c7x_ort_tensor_view *inputs, size_t n_inputs,
 			struct c7x_ort_tensor_view *outputs, size_t n_outputs,
 			struct c7x_ort_run_stats *stats_out) {
-	if (!sess || !sess->rt || !sess->cb) return -1;
+	if (!sess || !sess->rt) return -1;
+	auto t_start = std::chrono::steady_clock::now();
 
 	for (size_t i = 0; i < n_inputs; i++) {
 		std::string name = inputs[i].name ? inputs[i].name
@@ -1180,11 +1788,31 @@ int c7x_ort_session_run(c7x_ort_session_t *sess,
 		c7x_write(sess->rt, it->second.buf, 0u, inputs[i].data, it->second.nbytes);
 	}
 
-	struct c7x_exec_stats st {};
-	if (c7x_cmdbuf_submit(sess->rt, sess->cb, &st) != 0) {
-		fprintf(stderr, "ort-c7x-ep: C7X_OP_EXEC_LIST failed at cmd %u (done=%u)\n",
-			st.fail_idx, st.cmds_done);
-		return -4;
+	uint32_t cmds_done = 0u;
+	uint64_t dsp_cycles = 0ull, dsp_total_cycles = 0ull;
+	double cpu_fallback_us = 0.0;
+
+	for (const auto &stage : sess->stages) {
+		if (!stage.is_cpu) {
+			struct c7x_exec_stats st {};
+			if (c7x_cmdbuf_submit(sess->rt, stage.cb, &st) != 0) {
+				fprintf(stderr, "ort-c7x-ep: C7X_OP_EXEC_LIST failed at cmd %u (done=%u)\n",
+					st.fail_idx, st.cmds_done);
+				return -4;
+			}
+			cmds_done        += st.cmds_done;
+			dsp_cycles       += st.cycles;
+			dsp_total_cycles += st.total_cycles;
+		} else {
+			auto tc0 = std::chrono::steady_clock::now();
+			if (!run_cpu_node(sess, stage.cpu)) {
+				fprintf(stderr, "ort-c7x-ep: CPU fallback failed for op '%s'\n",
+					stage.cpu.op.c_str());
+				return -6;
+			}
+			auto tc1 = std::chrono::steady_clock::now();
+			cpu_fallback_us += std::chrono::duration<double, std::micro>(tc1 - tc0).count();
+		}
 	}
 
 	for (size_t i = 0; i < n_outputs; i++) {
@@ -1198,16 +1826,23 @@ int c7x_ort_session_run(c7x_ort_session_t *sess,
 		c7x_read(sess->rt, outputs[i].data, it->second.buf, 0u, it->second.nbytes);
 	}
 
+	auto t_end = std::chrono::steady_clock::now();
+	double wall_us = std::chrono::duration<double, std::micro>(t_end - t_start).count();
+
 	if (stats_out) {
-		stats_out->cmds_executed    = st.cmds_done;
-		stats_out->dsp_cycles       = st.cycles;
-		stats_out->dsp_total_cycles = st.total_cycles;
-		stats_out->wall_us          = st.wall_us;
+		stats_out->cmds_executed      = cmds_done;
+		stats_out->dsp_cycles         = dsp_cycles;
+		stats_out->dsp_total_cycles   = dsp_total_cycles;
+		stats_out->wall_us            = wall_us;
+		stats_out->c7x_subgraphs      = sess->n_c7x_subgraphs;
+		stats_out->c7x_nodes          = sess->n_c7x_nodes;
+		stats_out->cpu_fallback_nodes = sess->n_cpu_nodes;
+		stats_out->cpu_fallback_us    = cpu_fallback_us;
 	}
 	if (sess->opts.enable_profiling) {
-		fprintf(stderr, "ort-c7x-ep: cmds=%u dsp=%.3f ms total_dsp=%.3f ms wall=%.3f ms\n",
-			st.cmds_done, (double)st.cycles / 1e6, (double)st.total_cycles / 1e6,
-			st.wall_us / 1e3);
+		fprintf(stderr, "ort-c7x-ep: subgraphs=%u cmds=%u cpu_nodes=%u dsp=%.3f ms cpu=%.3f ms wall=%.3f ms\n",
+			sess->n_c7x_subgraphs, cmds_done, sess->n_cpu_nodes,
+			(double)dsp_cycles / 1e6, cpu_fallback_us / 1e3, wall_us / 1e3);
 	}
 	return 0;
 }

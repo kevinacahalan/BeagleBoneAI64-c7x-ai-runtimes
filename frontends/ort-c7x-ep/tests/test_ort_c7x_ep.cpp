@@ -53,7 +53,10 @@ static void calc_metrics(const float *got, const float *ref, size_t n,
 
 static int run_onnx_model_test(const std::string &dir, const char *label,
 			       const char *onnx_file, const char *in_file, const char *ref_file,
-			       float max_err_tol, float min_cos, int bench_iters) {
+			       float max_err_tol, float min_cos, int bench_iters,
+			       int allow_cpu_fallback = 0,
+			       uint32_t expect_subgraphs = 1u,
+			       uint32_t expect_cpu_nodes = 0u) {
 	std::vector<uint8_t> in_bytes, ref_bytes;
 	if (!load_bin(dir + "/" + in_file, in_bytes) ||
 	    !load_bin(dir + "/" + ref_file, ref_bytes)) {
@@ -61,17 +64,35 @@ static int run_onnx_model_test(const std::string &dir, const char *label,
 		return 1;
 	}
 
+	/* Verify strict C7x-only mode rejects graphs requiring CPU fallback. */
+	if (allow_cpu_fallback && expect_cpu_nodes > 0u) {
+		struct c7x_ort_ep_options strict_opts {};
+		strict_opts.use_msmc_weights   = 1;
+		strict_opts.emu_ddr_bytes      = 64ull * 1024ull * 1024ull;
+		strict_opts.allow_cpu_fallback = 0;
+		c7x_ort_session_t *bad = c7x_ort_session_create_from_file((dir + "/" + onnx_file).c_str(), &strict_opts);
+		if (bad != nullptr) {
+			fprintf(stderr, "[ort-c7x-ep] expected strict mode to reject %s\n", onnx_file);
+			c7x_ort_session_destroy(bad);
+			return 1;
+		}
+	}
+
 	struct c7x_ort_ep_options opts {};
-	opts.use_msmc_weights = 1;
-	opts.enable_profiling = 0;
-	opts.force_hostemu    = 0;
-	opts.emu_ddr_bytes    = 64ull * 1024ull * 1024ull;
+	opts.use_msmc_weights   = 1;
+	opts.enable_profiling   = 0;
+	opts.force_hostemu      = 0;
+	opts.emu_ddr_bytes      = 64ull * 1024ull * 1024ull;
+	opts.allow_cpu_fallback = allow_cpu_fallback;
 
 	c7x_ort_session_t *sess = c7x_ort_session_create_from_file((dir + "/" + onnx_file).c_str(), &opts);
 	if (!sess) {
 		fprintf(stderr, "[ort-c7x-ep] failed to compile %s\n", onnx_file);
 		return 1;
 	}
+
+	uint32_t sg = 0u, c7x_n = 0u, cpu_n = 0u;
+	c7x_ort_session_partition_info(sess, &sg, &c7x_n, &cpu_n);
 
 	struct c7x_ort_tensor_view iv {}, ov {};
 	if (c7x_ort_session_input_info(sess, 0, &iv) != 0 ||
@@ -100,7 +121,7 @@ static int run_onnx_model_test(const std::string &dir, const char *label,
 		     n_f32, max_abs, cos_sim);
 
 	/* Warm benchmark runs */
-	double total_wall_us = 0.0;
+	double total_wall_us = 0.0, total_cpu_us = 0.0;
 	uint64_t total_dsp_cyc = 0u;
 	for (int it = 0; it < bench_iters; it++) {
 		struct c7x_ort_run_stats bst {};
@@ -109,13 +130,16 @@ static int run_onnx_model_test(const std::string &dir, const char *label,
 			return 1;
 		}
 		total_wall_us += bst.wall_us;
+		total_cpu_us  += bst.cpu_fallback_us;
 		total_dsp_cyc += bst.dsp_cycles;
 	}
 
-	bool ok = (max_abs <= max_err_tol && cos_sim >= min_cos);
-	printf("[ort-c7x-ep] %-20s cmds=%u max_err=%.6f cos=%.6f dsp=%.3f ms wall=%.3f ms: %s\n",
-	       label, c7x_ort_session_num_cmds(sess), max_abs, cos_sim,
+	bool ok = (max_abs <= max_err_tol && cos_sim >= min_cos &&
+		   sg == expect_subgraphs && cpu_n == expect_cpu_nodes);
+	printf("[ort-c7x-ep] %-20s sg=%u cmds=%u cpu=%u max_err=%.6f cos=%.6f dsp=%.3f ms cpu=%.3f ms wall=%.3f ms: %s\n",
+	       label, sg, c7x_ort_session_num_cmds(sess), cpu_n, max_abs, cos_sim,
 	       (double)total_dsp_cyc / (1e6 * bench_iters),
+	       total_cpu_us / (1e3 * bench_iters),
 	       total_wall_us / (1e3 * bench_iters),
 	       ok ? "PASS" : "FAIL");
 
@@ -387,10 +411,16 @@ int main(int argc, char **argv) {
 	/* Note: Python ref uses float64 intermediate rounding vs C7x float32 -> rare 1-LSB INT8 boundary (~4.3e-3 on 4-layer cascade; exact <1e-6 vs fp32 ref). */
 	fail |= run_onnx_model_test(model_dir, "mobilenet_qlinear",
 				    "mobilenet_qlinear.onnx", "mobilenet_input.bin", "mobilenet_ref.bin",
-				    1e-2f, 0.99999f, bench_iters);
+				    1e-2f, 0.99999f, bench_iters, 0, 1u, 0u);
 	fail |= run_onnx_model_test(model_dir, "audio_enc_block",
 				    "audio_enc_block.onnx", "audio_input.bin", "audio_ref.bin",
-				    1e-4f, 0.99999f, bench_iters);
+				    1e-4f, 0.99999f, bench_iters, 0, 1u, 0u);
+	fail |= run_onnx_model_test(model_dir, "mobilenet_e2e_hyb",
+				    "mobilenet_e2e_hybrid.onnx", "mobilenet_e2e_input.bin", "mobilenet_e2e_ref.bin",
+				    1e-3f, 0.99999f, bench_iters, 1, 1u, 2u);
+	fail |= run_onnx_model_test(model_dir, "whisper_erf_hyb",
+				    "whisper_erf_hybrid.onnx", "whisper_erf_input.bin", "whisper_erf_ref.bin",
+				    1e-4f, 0.99999f, bench_iters, 1, 3u, 3u);
 	fail |= test_qlinear_matmul_asymmetric(bench_iters);
 	fail |= test_qlinear_unaligned_f32_and_ties();
 
