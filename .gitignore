@@ -7,19 +7,25 @@ models/
 .cache/
 
 # Yocto kas-container working trees.
-yocto/sources/
-yocto/downloads/
-yocto/build/
-yocto/sstate-cache/
+platform/yocto/sources/
+platform/yocto/downloads/
+platform/yocto/build/
+platform/yocto/sstate-cache/
 kas-container
 
 # Build outputs.
 out/
-dsp/build/
-linux-app/c7x-ai
-linux-app/*.o
-beagle-linux/overlays/*.dtbo
-beagle-linux/overlays/*.dts.tmp
+runtime/dsp/build/
+runtime/libc7x/build-aarch64/
+runtime/libc7x/build-hostemu/
+frontends/ggml-c7x/build-aarch64/
+frontends/ggml-c7x/build-hostemu/
+frontends/ort-c7x-ep/build-aarch64/
+frontends/ort-c7x-ep/build-hostemu/
+frontends/c7x-ai/c7x-ai
+frontends/c7x-ai/*.o
+platform/beagle-linux/overlays/*.dtbo
+platform/beagle-linux/overlays/*.dts.tmp
 *.o
 *.obj
 *.out

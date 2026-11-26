@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="476" viewBox="0 0 880 476" role="img" aria-label="BeagleBone AI-64 Live Silicon LLM Performance Tradeoff">
+<defs>
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</defs>
+<rect x="0.5" y="0.5" width="879" height="475" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+<text x="24" y="34" class="sans" font-size="16" font-weight="700" fill="#1f2328">Live BeagleBone AI-64 Silicon: Native .c7m vs. llama.cpp Plugin vs. Cortex-A72 CPU</text>
+<text x="24" y="54" class="sans" font-size="12" fill="#656d76">Throughput in tok/s (higher is better) · Each model normalized to its fastest bar so the ratio is visible across 135M–1.5B</text>
+<rect x="24" y="70" width="12" height="12" rx="2" fill="#8c959f"/>
+<text x="42" y="80" class="sans" font-size="12" fill="#656d76">2T Cortex-A72 CPU (llama.cpp)</text>
+<rect x="250" y="70" width="12" height="12" rx="2" fill="#0969da"/>
+<text x="268" y="80" class="sans" font-size="12" fill="#656d76">Path 2: Unmodified llama.cpp + libggml-c7x.so</text>
+<rect x="572" y="70" width="12" height="12" rx="2" fill="#1a7f37"/>
+<text x="590" y="80" class="sans" font-size="12" fill="#656d76">Path 1: Native .c7m (c7x-ai)</text>
+<line x1="24" y1="96" x2="856" y2="96" stroke="#d0d7de" stroke-width="1"/>
+<text x="24" y="122" class="sans" font-size="13" font-weight="700" fill="#1f2328">Prompt Prefill (pp128 vs. pp146–160)</text>
+<text x="24" y="148" class="mono" font-size="12" font-weight="700" fill="#1f2328">SmolLM2-135M</text>
+<text x="416" y="148" text-anchor="end" class="sans" font-size="11" fill="#656d76">54% of .c7m · 3.8x A72</text>
+<text x="104" y="166" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="112" y="156" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="156" width="35.4" height="12" rx="3" fill="#8c959f"/>
+<text x="416" y="166" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">46.2</text>
+<text x="104" y="183" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="112" y="173" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="173" width="134.1" height="12" rx="3" fill="#0969da"/>
+<text x="416" y="183" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">175.1</text>
+<text x="104" y="200" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="112" y="190" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="190" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="416" y="200" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">323.9</text>
+<text x="24" y="222" class="mono" font-size="12" font-weight="700" fill="#1f2328">Qwen2.5-0.5B</text>
+<text x="416" y="222" text-anchor="end" class="sans" font-size="11" fill="#656d76">70% of .c7m · 8.5x A72</text>
+<text x="104" y="240" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="112" y="230" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="230" width="20.6" height="12" rx="3" fill="#8c959f"/>
+<text x="416" y="240" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">14.0</text>
+<text x="104" y="257" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="112" y="247" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="247" width="173.9" height="12" rx="3" fill="#0969da"/>
+<text x="416" y="257" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">118.3</text>
+<text x="104" y="274" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="112" y="264" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="264" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="416" y="274" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">168.7</text>
+<text x="24" y="296" class="mono" font-size="12" font-weight="700" fill="#1f2328">Qwen3-0.6B</text>
+<text x="416" y="296" text-anchor="end" class="sans" font-size="11" fill="#656d76">65% of .c7m · 5.4x A72</text>
+<text x="104" y="314" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="112" y="304" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="304" width="30.1" height="12" rx="3" fill="#8c959f"/>
+<text x="416" y="314" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">12.7</text>
+<text x="104" y="331" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="112" y="321" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="321" width="161.6" height="12" rx="3" fill="#0969da"/>
+<text x="416" y="331" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">68.1</text>
+<text x="104" y="348" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="112" y="338" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="338" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="416" y="348" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">104.5</text>
+<text x="24" y="370" class="mono" font-size="12" font-weight="700" fill="#1f2328">Qwen2.5-1.5B</text>
+<text x="416" y="370" text-anchor="end" class="sans" font-size="11" fill="#656d76">88% of .c7m · 12.8x A72</text>
+<text x="104" y="388" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="112" y="378" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="378" width="17.0" height="12" rx="3" fill="#8c959f"/>
+<text x="416" y="388" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">4.9</text>
+<text x="104" y="405" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="112" y="395" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="395" width="218.2" height="12" rx="3" fill="#0969da"/>
+<text x="416" y="405" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">63.0</text>
+<text x="104" y="422" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="112" y="412" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="112" y="412" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="416" y="422" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">71.6</text>
+<text x="456" y="122" class="sans" font-size="13" font-weight="700" fill="#1f2328">Token Decode (tg32 vs. short-ctx)</text>
+<text x="456" y="148" class="mono" font-size="12" font-weight="700" fill="#1f2328">SmolLM2-135M</text>
+<text x="848" y="148" text-anchor="end" class="sans" font-size="11" fill="#656d76">41% of .c7m · 1.7x A72</text>
+<text x="536" y="166" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="544" y="156" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="156" width="61.3" height="12" rx="3" fill="#8c959f"/>
+<text x="848" y="166" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">28.6</text>
+<text x="536" y="183" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="544" y="173" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="173" width="102.2" height="12" rx="3" fill="#0969da"/>
+<text x="848" y="183" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">47.7</text>
+<text x="536" y="200" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="544" y="190" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="190" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="848" y="200" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">115.7</text>
+<text x="456" y="222" class="mono" font-size="12" font-weight="700" fill="#1f2328">Qwen2.5-0.5B</text>
+<text x="848" y="222" text-anchor="end" class="sans" font-size="11" fill="#656d76">41% of .c7m · 1.7x A72</text>
+<text x="536" y="240" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="544" y="230" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="230" width="60.8" height="12" rx="3" fill="#8c959f"/>
+<text x="848" y="240" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">8.6</text>
+<text x="536" y="257" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="544" y="247" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="247" width="101.0" height="12" rx="3" fill="#0969da"/>
+<text x="848" y="257" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">14.3</text>
+<text x="536" y="274" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="544" y="264" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="264" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="848" y="274" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">35.1</text>
+<text x="456" y="296" class="mono" font-size="12" font-weight="700" fill="#1f2328">Qwen3-0.6B</text>
+<text x="848" y="296" text-anchor="end" class="sans" font-size="11" fill="#656d76">48% of .c7m · 1.7x A72</text>
+<text x="536" y="314" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="544" y="304" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="304" width="71.1" height="12" rx="3" fill="#8c959f"/>
+<text x="848" y="314" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">7.8</text>
+<text x="536" y="331" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="544" y="321" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="321" width="119.4" height="12" rx="3" fill="#0969da"/>
+<text x="848" y="331" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">13.1</text>
+<text x="536" y="348" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="544" y="338" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="338" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="848" y="348" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">27.2</text>
+<text x="456" y="370" class="mono" font-size="12" font-weight="700" fill="#1f2328">Qwen2.5-1.5B</text>
+<text x="848" y="370" text-anchor="end" class="sans" font-size="11" fill="#656d76">72% of .c7m · 2.3x A72</text>
+<text x="536" y="388" text-anchor="end" class="sans" font-size="11" fill="#656d76">A72 CPU</text>
+<rect x="544" y="378" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="378" width="77.0" height="12" rx="3" fill="#8c959f"/>
+<text x="848" y="388" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">3.6</text>
+<text x="536" y="405" text-anchor="end" class="sans" font-size="11" fill="#656d76">ggml-c7x</text>
+<rect x="544" y="395" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="395" width="177.4" height="12" rx="3" fill="#0969da"/>
+<text x="848" y="405" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">8.3</text>
+<text x="536" y="422" text-anchor="end" class="sans" font-size="11" fill="#656d76">native .c7m</text>
+<rect x="544" y="412" width="248" height="12" rx="3" fill="#eaeef2"/>
+<rect x="544" y="412" width="248.0" height="12" rx="3" fill="#1a7f37"/>
+<text x="848" y="422" text-anchor="end" class="mono" font-size="11" font-weight="600" fill="#1f2328">11.6</text>
+<text x="24" y="462" class="sans" font-size="11" fill="#656d76">Source: docs/RESULTS.md · BeagleBone AI-64 (TI TDA4VM C71x+MMA @ 1.0 GHz vs. dual Cortex-A72 @ 2.0 GHz)</text>
+</svg>
