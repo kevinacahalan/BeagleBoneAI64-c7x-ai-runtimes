@@ -11,8 +11,8 @@ One shared bare-metal firmware (`c7x-ai.elf`) and host runtime (`libc7x`) power 
 | Path | Role | Model Format | Measured Live Silicon Speed | Advantages | Tradeoffs |
 | --- | --- | --- | --- | --- | --- |
 | **1. Native `.c7m` (`c7x-ai`)** | **Fastest LLM decode & long context** | Custom `.c7m` (converted from HuggingFace via `tools/convert_hf.py`) | **Up to `13.8×` prefill / `3.8×` decode** vs 2T A72<br>`SmolLM2-135M`: **`323.9` / `115.7 t/s`**<br>`Qwen2.5-1.5B`: **`71.6` / `11.6 t/s`** | Hand-fused L2 SRAM layers, 2K–4K **INT8 KV cache**, MSMC layer pinning (`871 t/s` on `stories15M`), built-in `chat` REPL & OpenAI SSE `serve`, zero GGUF requant loss | Only supports Llama, SmolLM2, Qwen2/2.5, Qwen3, Mistral; requires `.c7m` conversion step |
-| **2. `llama.cpp` Plugin (`ggml-c7x`)** | **Most convenient / standard ecosystem** | Stock `.gguf` (`Q4_0`, `Q4_K_M`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, `F32`) | **Up to `12.8×` prefill / `2.3×` decode** vs 2T A72<br>`SmolLM2-135M`: **`175.1` / `47.7 t/s`**<br>`Qwen2.5-1.5B`: **`63.0` / `8.3 t/s`** | Zero-fork dynamic plugin (`GGML_BACKEND_PATH=libggml-c7x.so`); inherits full `llama.cpp` & `whisper.cpp` features (new models, grammars, LoRA, `llama-server`, Vision/Audio ops) | `1.4×–2.4×` slower decode than `.c7m` (discrete DDR ops, F16 KV); default `W4A8` repacking adds PPL drift (use `GGML_C7X_W8A8=1` for 2.4–10× lower drift at 2× weight RAM) |
-| **3. ONNX EP (`ort-c7x-ep`)** | **Vision CNNs & audio encoders** | Standard `.onnx` (INT8/UINT8 `QLinear` & FP32) | `mobilenet_qlinear.onnx`: **`81.6 FPS`** (`12.2 ms`)<br>`audio_enc_block.onnx`: **`882.6 FPS`** (`1.13 ms`)<br>`QLinearMatMul`: **`19.6 GOPS` (`4.75×` vs A72)** | Zero-dependency `.onnx` protobuf compiler lowering entire CNN/audio graphs into **1 DSP RPC**, asymmetric INT8/UINT8 `QLinearConv` (std + depthwise) & `QLinearMatMul` | Standalone `.onnx` runner (graphs with unsupported ops fail compilation cleanly rather than falling back per-node to CPU) |
+| **2. `llama.cpp` Plugin (`ggml-c7x`)** | **Most convenient / standard ecosystem** | Stock `.gguf` (`Q4_0`, `Q4_K_M`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, `F32`) | **Up to `12.8×` prefill / `2.3×` decode** vs 2T A72<br>`SmolLM2-135M`: **`185.4` / `55.3 t/s`** (`-fa on`)<br>`Qwen2.5-1.5B`: **`63.0` / `8.3 t/s`** | Zero-fork dynamic plugin (`/usr/lib/c7x-ai/libggml-c7x.so`); native **FlashAttention-2** (`-fa on`), **`Q8_0` KV cache** (`-ctk q8_0 -ctv q8_0`), peephole op fusion, full `llama.cpp` & `whisper.cpp` ecosystem | `1.4×–2.1×` slower decode than `.c7m` (discrete DDR ops + host logits read); default `W4A8` repacking adds PPL drift (use `GGML_C7X_W8A8=1` for 2.4–10× lower drift at 2× weight RAM) |
+| **3. ONNX EP (`ort-c7x-ep`)** | **Vision CNNs & audio encoders** | Standard `.onnx` (INT8/UINT8 `QLinear`, FP32, & hybrid graphs) | `mobilenet_qlinear.onnx`: **`81.6 FPS`** (`12.2 ms`)<br>`mobilenet_e2e_hybrid`: **`72.3 FPS`** (`13.8 ms`)<br>`audio_enc_block.onnx`: **`882.6 FPS`** (`1.13 ms`)<br>`QLinearMatMul`: **`19.6 GOPS` (`4.75×` vs A72)** | Zero-dependency `.onnx` compiler lowering C7x subgraphs into **1 RPC**, optional **hybrid C7x+CPU partitioning** (`allow_cpu_fallback=1`) for `QuantizeLinear`/`Softmax`/erf-`Gelu`, plus ORT C API shim (`OrtSessionOptionsAppendExecutionProvider_C7x`) | CPU fallback covers common pre/post/transformer glue ops (`QuantizeLinear`, `Softmax`, `Gelu`, `Clip`, `Transpose`, `Concat`, `Resize`); exotic ops still fail cleanly |
 
 > **Rule of thumb:** Use **Path 1 (`c7x-ai`)** for maximum LLM speed and 4K-context serving on supported architectures; use **Path 2 (`ggml-c7x`)** to run any off-the-shelf GGUF in stock `llama.cpp`; use **Path 3 (`ort-c7x-ep`)** for quantized vision CNNs and audio blocks. All three run on the **same `c7x-ai.elf` firmware**.
 
@@ -30,7 +30,7 @@ flowchart TB
 
   subgraph Runtime["Shared Runtime Foundation (runtime/)"]
     RT["runtime/libc7x<br/>Coalescing 1.5 GiB DDR + 7.625 MiB MSMC allocator<br/>Tile-major weight packers · HW & x86_64 hostemu"]
-    FW["runtime/dsp (c7x-ai.elf)<br/>C7X_OP_EXEC_LIST (21 composable ops) + Monolithic Transformer<br/>C71x MMA · SE0/SE1 · 512-bit Vec · Type-9 DRU0 DMA"]
+    FW["runtime/dsp (c7x-ai.elf)<br/>C7X_OP_EXEC_LIST (22 composable ops incl. FlashAttention-2) + Monolithic Transformer<br/>C71x MMA · SE0/SE1 · 512-bit Vec · Type-9 DRU0 DMA"]
   end
 
   F1 -->|"Monolithic RPC + board ctrl"| FW
@@ -104,32 +104,32 @@ See [`frontends/c7x-ai/README.md`](frontends/c7x-ai/README.md) for all CLI comma
 
 ### Path 2: Unmodified `llama.cpp` Dynamic Backend (`frontends/ggml-c7x/`)
 
-Build upstream `llama.cpp` with `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON` (zero patches to `llama.cpp`), build `libggml-c7x.so` with `./platform/beagle-linux/scripts/build.sh ggml`, and point `GGML_BACKEND_PATH` at it:
+`install-beagle.sh` installs `/usr/lib/c7x-ai/libggml-c7x.so` directly onto the board. Build upstream `llama.cpp` with `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON` (zero patches to `llama.cpp`) and point `GGML_BACKEND_PATH` at it:
 
 ```bash
 # On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`):
-GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-bench --list-devices
-GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-completion -m model-Q4_0.gguf -ngl 99 -fa off -p "Hello"
+GGML_BACKEND_PATH=/usr/lib/c7x-ai/libggml-c7x.so llama-bench --list-devices
+GGML_BACKEND_PATH=/usr/lib/c7x-ai/libggml-c7x.so llama-completion -m model-Q4_0.gguf -ngl 99 -p "Hello"
+
+# Optional 2x smaller Q8_0 KV cache (native C7x FlashAttention-2):
+GGML_BACKEND_PATH=/usr/lib/c7x-ai/libggml-c7x.so llama-completion -m model-Q4_0.gguf -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -p "Hello"
 
 # Optional higher-accuracy W8A8 repacking (cuts Q4_0/Q4_K PPL delta by 2.4–10x at 2x weight RAM):
-GGML_C7X_W8A8=1 GGML_BACKEND_PATH=/path/to/libggml-c7x.so llama-completion -m model-Q4_K_M.gguf -ngl 99 -fa off -p "Hello"
+GGML_C7X_W8A8=1 GGML_BACKEND_PATH=/usr/lib/c7x-ai/libggml-c7x.so llama-completion -m model-Q4_K_M.gguf -ngl 99 -p "Hello"
 ```
 
 See [`frontends/ggml-c7x/README.md`](frontends/ggml-c7x/README.md) for supported ops, Vision/Audio (`whisper.cpp`) ops, and environment flags.
 
 ### Path 3: ONNX Vision & Audio Execution Provider (`frontends/ort-c7x-ep/`)
 
-Compiles standard `.onnx` graphs (INT8/UINT8 `QLinearConv` standard + depthwise, `QLinearMatMul`, `DequantizeLinear`, `Conv`, `Gemm`, `LayerNormalization`, pooling, activations) into a single C7x command buffer:
+`install-beagle.sh` installs `/usr/lib/c7x-ai/libort-c7x-ep.so`, `/usr/lib/c7x-ai/test_ort_c7x_ep`, and all four ONNX verification models (`mobilenet_qlinear`, `audio_enc_block`, `mobilenet_e2e_hybrid`, `whisper_erf_hybrid`) into `/usr/share/c7x-ai/models/`:
 
 ```bash
-# On PC: build & run host-emulation test suite (generates + verifies mobilenet_qlinear & audio_enc_block)
-./platform/beagle-linux/scripts/build.sh ort
-
-# On BeagleBone AI-64 (after copying build-aarch64/test_ort_c7x_ep & build-hostemu/models):
-./test_ort_c7x_ep ./models 20
+# On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`):
+/usr/lib/c7x-ai/test_ort_c7x_ep /usr/share/c7x-ai/models 20
 ```
 
-See [`frontends/ort-c7x-ep/README.md`](frontends/ort-c7x-ep/README.md) for the C API, supported ONNX operators, and strict validation rules.
+See [`frontends/ort-c7x-ep/README.md`](frontends/ort-c7x-ep/README.md) for the C API, hybrid C7x+CPU subgraph partitioning (`allow_cpu_fallback = 1`), and the ONNX Runtime C API shim (`OrtSessionOptionsAppendExecutionProvider_C7x`).
 
 ---
 

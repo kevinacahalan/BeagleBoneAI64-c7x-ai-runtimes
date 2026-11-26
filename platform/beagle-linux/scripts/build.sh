@@ -134,6 +134,16 @@ bundle() {
 	if [[ -f $ROOT/frontends/ggml-c7x/build-aarch64/libggml-c7x.so ]]; then
 		cp -p "$ROOT/frontends/ggml-c7x/build-aarch64/libggml-c7x.so" "$out/"
 	fi
+	if [[ -f $ROOT/frontends/ort-c7x-ep/build-aarch64/libort-c7x-ep.so ]]; then
+		cp -p "$ROOT/frontends/ort-c7x-ep/build-aarch64/libort-c7x-ep.so" "$out/"
+	fi
+	if [[ -f $ROOT/frontends/ort-c7x-ep/build-aarch64/test_ort_c7x_ep ]]; then
+		cp -p "$ROOT/frontends/ort-c7x-ep/build-aarch64/test_ort_c7x_ep" "$out/"
+	fi
+	if [[ -d $ROOT/frontends/ort-c7x-ep/build-hostemu/models ]]; then
+		mkdir -p "$out/models"
+		cp -p "$ROOT"/frontends/ort-c7x-ep/build-hostemu/models/* "$out/models/"
+	fi
 	echo "bundle in $out"
 	echo "  scp -r out/c7x-ai-beagle USER@BOARD:"
 	echo "  ssh -t USER@BOARD 'sudo ./c7x-ai-beagle/install-beagle.sh && sudo reboot'"

@@ -46,6 +46,7 @@ enum c7x_cmd_op {
 	C7X_CMD_QLINEAR_MATMUL  = 19u, /* Asymmetric INT8/UINT8 MMA MatMul + zero-points + requant */
 	C7X_CMD_QLINEAR_CONV2D  = 20u, /* Asymmetric INT8/UINT8 L2-fused im2col + MMA Conv2D */
 	C7X_CMD_DEQUANTIZE_LIN  = 21u, /* INT8/UINT8 -> FP32 DequantizeLinear (tensor or per-axis) */
+	C7X_CMD_FLASH_ATTN_EXT  = 22u, /* Fused FlashAttention-2 (Q F32 x K/V F16/F32/Q8_0 + mask + sinks) */
 };
 
 /* Common command flags */
@@ -61,6 +62,7 @@ enum c7x_cmd_op {
 #define C7X_CMD_FLAG_Y_UINT8    (1u << 9) /* QLinear output Y is uint8 (else int8) */
 #define C7X_CMD_FLAG_Y_F32      (1u << 10) /* QLinear output Y is FP32 (dequantized) */
 #define C7X_CMD_FLAG_BIAS_I32   (1u << 11) /* QLinear bias in src2 is int32 (else float32) */
+#define C7X_CMD_FLAG_SRC0_Q8_0  (1u << 12) /* src0 is GGML Q8_0 blocks (34B / 32 elems) for MATMUL_F32 */
 
 /* Pooling modes for C7X_CMD_POOL_2D_F32 */
 enum c7x_pool_op {
@@ -367,6 +369,30 @@ struct c7x_dequant_desc {
 	float    scalar_scale;  /* used when axis_dim == 1 */
 };
 
+struct c7x_flash_attn_desc {
+	uint32_t neq[4];        /* Q: [DK, N, n_head, b3] */
+	uint32_t nek[4];        /* K: [DK, n_kv, n_head_k, b3_k] */
+	uint32_t nev[4];        /* V: [DV, n_kv, n_head_v, b3_v] */
+	uint32_t nem[4];        /* mask: [n_kv, N_m, ne_m2, ne_m3] */
+	uint32_t k_dtype;       /* C7X_DTYPE_F32 / F16 / Q8_0 */
+	uint32_t v_dtype;       /* C7X_DTYPE_F32 / F16 / Q8_0 */
+	uint32_t mask_dtype;    /* C7X_DTYPE_F16 / F32 */
+	uint32_t n_head_log2;   /* 1u << floor(log2(n_head)) for ALiBi */
+	float    scale;
+	float    max_bias;
+	float    logit_softcap;
+	float    m0;
+	float    m1;
+	uint32_t reserved0;
+	uint64_t nbq[4];
+	uint64_t nbk[4];
+	uint64_t nbv[4];
+	uint64_t nbm[4];
+	uint64_t nb_dst[4];     /* dst: [DV, n_head, N, b3] */
+	uint64_t mask_addr;
+	uint64_t sinks_addr;
+};
+
 typedef char c7x_cmd_size_assert_[sizeof(struct c7x_cmd) == 96u ? 1 : -1];
 typedef char c7x_binop_desc_size_assert_[sizeof(struct c7x_4d_binop_desc) == 144u ? 1 : -1];
 typedef char c7x_mm_desc_size_assert_[sizeof(struct c7x_matmul_f32_desc) == 144u ? 1 : -1];
@@ -382,6 +408,7 @@ typedef char c7x_conv2d_desc_size_assert_[sizeof(struct c7x_conv2d_f32_desc) == 
 typedef char c7x_qmm_desc_size_assert_[sizeof(struct c7x_qlinear_matmul_desc) == 64u ? 1 : -1];
 typedef char c7x_qconv_desc_size_assert_[sizeof(struct c7x_qlinear_conv2d_desc) == 112u ? 1 : -1];
 typedef char c7x_dequant_desc_size_assert_[sizeof(struct c7x_dequant_desc) == 24u ? 1 : -1];
+typedef char c7x_fa_desc_size_assert_[sizeof(struct c7x_flash_attn_desc) == 280u ? 1 : -1];
 
 #ifdef __cplusplus
 }

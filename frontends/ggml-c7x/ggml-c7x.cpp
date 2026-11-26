@@ -785,8 +785,9 @@ static bool lower_node(ggml_backend_c7x_context * ctx,
                 return push_cmd(ctx, node, cmd);
             }
 
-            // General exact 4D batched F32 / F16 matmul
-            if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+            // General exact 4D batched F32 / F16 / Q8_0 (KV cache) matmul
+            if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                 (src0->type == GGML_TYPE_Q8_0 && src0->nb[0] == sizeof(block_q8_0) && (src0->ne[0] % 32) == 0)) &&
                 src1->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32) {
                 const uint64_t p_src0 = phys(src0);
                 if (!p_src0) return false;
@@ -800,7 +801,8 @@ static bool lower_node(ggml_backend_c7x_context * ctx,
                     md.nb_dst[i] = (uint64_t) node->nb[i];
                 }
                 cmd.op    = C7X_CMD_MATMUL_F32;
-                cmd.flags = (src0->type == GGML_TYPE_F16) ? C7X_CMD_FLAG_SRC0_F16 : 0u;
+                cmd.flags = (src0->type == GGML_TYPE_F16)  ? C7X_CMD_FLAG_SRC0_F16  :
+                            (src0->type == GGML_TYPE_Q8_0) ? C7X_CMD_FLAG_SRC0_Q8_0 : 0u;
                 cmd.src0  = p_src0;
                 cmd.src1  = p_src1;
                 cmd.dst   = p_dst;
@@ -1224,6 +1226,63 @@ static bool lower_node(ggml_backend_c7x_context * ctx,
             return push_cmd(ctx, node, cmd, &cd, sizeof(cd));
         }
 
+        case GGML_OP_FLASH_ATTN_EXT: {
+            const struct ggml_tensor * q     = node->src[0];
+            const struct ggml_tensor * k     = node->src[1];
+            const struct ggml_tensor * v     = node->src[2];
+            const struct ggml_tensor * mask  = node->src[3];
+            const struct ggml_tensor * sinks = node->src[4];
+            const uint64_t p_q = phys(q), p_k = phys(k), p_v = phys(v), p_dst = phys(node);
+            uint32_t k_dt = 0, v_dt = 0, m_dt = C7X_DTYPE_F16;
+            if (!p_q || !p_k || !p_v || !p_dst ||
+                !ggml_type_to_c7x_dtype(k->type, &k_dt) ||
+                !ggml_type_to_c7x_dtype(v->type, &v_dt)) {
+                return false;
+            }
+            if (mask && !ggml_type_to_c7x_dtype(mask->type, &m_dt)) {
+                return false;
+            }
+            float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+            memcpy(&scale,         (const float *) node->op_params + 0, sizeof(float));
+            memcpy(&max_bias,      (const float *) node->op_params + 1, sizeof(float));
+            memcpy(&logit_softcap, (const float *) node->op_params + 2, sizeof(float));
+
+            const uint32_t n_head      = (uint32_t) q->ne[2];
+            const uint32_t n_head_log2 = 1u << (uint32_t) std::floor(std::log2((double) n_head));
+            struct c7x_flash_attn_desc fd {};
+            for (int i = 0; i < 4; i++) {
+                fd.neq[i]    = (uint32_t) q->ne[i];
+                fd.nek[i]    = (uint32_t) k->ne[i];
+                fd.nev[i]    = (uint32_t) v->ne[i];
+                fd.nem[i]    = mask ? (uint32_t) mask->ne[i] : 0u;
+                fd.nbq[i]    = (uint64_t) q->nb[i];
+                fd.nbk[i]    = (uint64_t) k->nb[i];
+                fd.nbv[i]    = (uint64_t) v->nb[i];
+                fd.nbm[i]    = mask ? (uint64_t) mask->nb[i] : 0ull;
+                fd.nb_dst[i] = (uint64_t) node->nb[i];
+            }
+            fd.k_dtype       = k_dt;
+            fd.v_dtype       = v_dt;
+            fd.mask_dtype    = m_dt;
+            fd.n_head_log2   = n_head_log2;
+            fd.scale         = scale;
+            fd.max_bias      = max_bias;
+            fd.logit_softcap = logit_softcap;
+            fd.m0            = (max_bias > 0.0f) ? std::pow(2.0f, -max_bias / (float) n_head_log2) : 1.0f;
+            fd.m1            = (max_bias > 0.0f) ? std::pow(2.0f, -(max_bias * 0.5f) / (float) n_head_log2) : 1.0f;
+            fd.mask_addr     = mask  ? phys(mask)  : 0ull;
+            fd.sinks_addr    = sinks ? phys(sinks) : 0ull;
+            if ((mask && !fd.mask_addr) || (sinks && !fd.sinks_addr)) {
+                return false;
+            }
+            cmd.op   = C7X_CMD_FLASH_ATTN_EXT;
+            cmd.src0 = p_q;
+            cmd.src1 = p_k;
+            cmd.src2 = p_v;
+            cmd.dst  = p_dst;
+            return push_cmd(ctx, node, cmd, &fd, sizeof(fd));
+        }
+
         default:
             return false;
     }
@@ -1244,6 +1303,93 @@ static void ggml_backend_c7x_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Try to fuse consecutive node pairs (RMS_NORM + MUL weight, SILU + MUL SwiGLU)
+// when `node` has a single consumer (`next`) and is not exposed as a graph output/view.
+static bool try_lower_fused_pair(ggml_backend_c7x_context * ctx,
+                                 struct ggml_tensor * node,
+                                 struct ggml_tensor * next,
+                                 int node_uses,
+                                 const char ** fused_name_out) {
+    if (!node || !next || node_uses != 1 ||
+        (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(next)) {
+        return false;
+    }
+    c7x_ctx_t * rt = ctx->dev_ctx->rt;
+    auto phys = [rt](const struct ggml_tensor * t) -> uint64_t {
+        return (t && t->data) ? c7x_host_to_phys(rt, t->data) : 0ull;
+    };
+
+    // Pattern 1: RMS_NORM(x) -> MUL(norm, weight[ne0, 1, 1, 1]) ==> weighted C7X_CMD_RMS_NORM_F32
+    if (node->op == GGML_OP_RMS_NORM && next->op == GGML_OP_MUL &&
+        next->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(node, next) && ggml_is_contiguous(next)) {
+        const struct ggml_tensor * w = nullptr;
+        if (next->src[0] == node && next->src[1] && next->src[1] != node) {
+            w = next->src[1];
+        } else if (next->src[1] == node && next->src[0] && next->src[0] != node) {
+            w = next->src[0];
+        }
+        if (w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) &&
+            w->ne[0] == node->ne[0] && w->ne[1] == 1 && w->ne[2] == 1 && w->ne[3] == 1) {
+            const struct ggml_tensor * x = node->src[0];
+            const uint64_t p_x = phys(x), p_w = phys(w), p_dst = phys(next);
+            if (p_x && p_w && p_dst && p_w != p_dst) {
+                float eps = 0.0f;
+                memcpy(&eps, node->op_params, sizeof(float));
+                struct c7x_cmd cmd {};
+                cmd.op   = C7X_CMD_RMS_NORM_F32;
+                cmd.p0   = (uint32_t) x->ne[0];
+                cmd.p1   = (uint32_t) ggml_nrows(x);
+                cmd.p2   = (uint32_t) (x->nb[1] / sizeof(float));
+                cmd.p3   = (uint32_t) (next->nb[1] / sizeof(float));
+                cmd.f0   = eps;
+                cmd.src0 = p_x;
+                cmd.src1 = p_w;
+                cmd.dst  = p_dst;
+                if (push_cmd(ctx, next, cmd)) {
+                    if (fused_name_out) *fused_name_out = "RMS_NORM_MUL";
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Pattern 2: UNARY(SILU, gate) -> MUL(silu_gate, up) ==> C7X_CMD_GLU_F32 (SWIGLU)
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SILU &&
+        next->op == GGML_OP_MUL && next->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(node, next) && ggml_is_contiguous(next)) {
+        const struct ggml_tensor * up = nullptr;
+        if (next->src[0] == node && next->src[1] && next->src[1] != node) {
+            up = next->src[1];
+        } else if (next->src[1] == node && next->src[0] && next->src[0] != node) {
+            up = next->src[0];
+        }
+        const struct ggml_tensor * gate = node->src[0];
+        if (gate && up && up->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(gate, up) && ggml_is_contiguous(gate) && ggml_is_contiguous(up)) {
+            const uint64_t p_gate = phys(gate), p_up = phys(up), p_dst = phys(next);
+            if (p_gate && p_up && p_dst) {
+                struct c7x_cmd cmd {};
+                cmd.op   = C7X_CMD_GLU_F32;
+                cmd.p0   = (uint32_t) next->ne[0];
+                cmd.p1   = (uint32_t) ggml_nrows(next);
+                cmd.p2   = C7X_GLU_SWIGLU;
+                cmd.p4   = (uint32_t) (gate->nb[1] / sizeof(float));
+                cmd.p5   = (uint32_t) (up->nb[1] / sizeof(float));
+                cmd.src0 = p_gate;
+                cmd.src1 = p_up;
+                cmd.dst  = p_dst;
+                if (push_cmd(ctx, next, cmd)) {
+                    if (fused_name_out) *fused_name_out = "SILU_MUL_SWIGLU";
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 static enum ggml_status ggml_backend_c7x_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_backend_c7x_context *>(backend->context);
     static const int profile = []() {
@@ -1253,13 +1399,34 @@ static enum ggml_status ggml_backend_c7x_graph_compute(ggml_backend_t backend, s
     c7x_cmdbuf_reset(ctx->cmdbuf);
     ctx->cmd_nodes.clear();
 
+    // Count references to every tensor in cgraph so peephole fusion never drops a live intermediate.
+    std::unordered_map<const struct ggml_tensor *, int> use_cnt;
+    use_cnt.reserve((size_t) cgraph->n_nodes * 2u);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * t = cgraph->nodes[i];
+        if (!t) continue;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (t->src[s]) use_cnt[t->src[s]]++;
+        }
+        if (t->view_src) use_cnt[t->view_src]++;
+    }
+    if (cgraph->n_nodes > 0 && cgraph->nodes[cgraph->n_nodes - 1]) {
+        // Protect final graph output from being elided as an intermediate.
+        use_cnt[cgraph->nodes[cgraph->n_nodes - 1]]++;
+    }
+
     if (profile >= 2) {
         std::unordered_map<std::string, std::pair<uint32_t, uint64_t>> by_key;
         uint64_t total_cyc = 0;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
             if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(node)) continue;
-            if (!lower_node(ctx, backend->device, node)) {
+            const char * fused_name = nullptr;
+            bool fused = (i + 1 < cgraph->n_nodes) &&
+                         try_lower_fused_pair(ctx, node, cgraph->nodes[i + 1], use_cnt[node], &fused_name);
+            if (fused) {
+                i++;
+            } else if (!lower_node(ctx, backend->device, node)) {
                 GGML_LOG_ERROR("ggml-c7x: failed to lower node %d (%s, op=%s)\n",
                                i, node->name, ggml_op_name(node->op));
                 return GGML_STATUS_FAILED;
@@ -1273,8 +1440,8 @@ static enum ggml_status ggml_backend_c7x_graph_compute(ggml_backend_t backend, s
                     ctx->cmd_nodes.clear();
                     return GGML_STATUS_FAILED;
                 }
-                std::string key = ggml_op_name(node->op);
-                if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
+                std::string key = fused ? std::string(fused_name) : std::string(ggml_op_name(node->op));
+                if (!fused && node->op == GGML_OP_MUL_MAT && node->src[0]) {
                     key += ":";
                     key += ggml_type_name(node->src[0]->type);
                     if (node->src[0]->nb[0] != ggml_type_size(node->src[0]->type)) {
@@ -1307,6 +1474,11 @@ static enum ggml_status ggml_backend_c7x_graph_compute(ggml_backend_t backend, s
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(node)) {
+            continue;
+        }
+        if (i + 1 < cgraph->n_nodes &&
+            try_lower_fused_pair(ctx, node, cgraph->nodes[i + 1], use_cnt[node], nullptr)) {
+            i++;
             continue;
         }
         if (!lower_node(ctx, backend->device, node)) {
@@ -1461,6 +1633,13 @@ static bool ggml_backend_c7x_dev_supports_op(ggml_backend_dev_t dev, const struc
                      src0->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
                     return true;
                 }
+            }
+            // Non-WEIGHTS Q8_0 (e.g. -ctk q8_0 -ctv q8_0 KV cache) via exact C7X_CMD_MATMUL_F32 + SRC0_Q8_0
+            if (src0->type == GGML_TYPE_Q8_0 &&
+                src0->nb[0] == sizeof(block_q8_0) &&
+                (src0->ne[0] % 32) == 0 &&
+                (src0->buffer == nullptr || src0->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+                return true;
             }
             return false;
         }
@@ -1645,6 +1824,46 @@ static bool ggml_backend_c7x_dev_supports_op(ggml_backend_dev_t dev, const struc
                 return false;
             }
             return ggml_is_contiguous(src0) && src0->ne[2] == src1->ne[2];
+        }
+
+        case GGML_OP_FLASH_ATTN_EXT: {
+            const struct ggml_tensor * q       = op->src[0];
+            const struct ggml_tensor * k       = op->src[1];
+            const struct ggml_tensor * v       = op->src[2];
+            const struct ggml_tensor * mask    = op->src[3];
+            const struct ggml_tensor * sinks   = op->src[4];
+            const struct ggml_tensor * kv_rows = op->src[5];
+            if (!q || !k || !v || kv_rows != nullptr) {
+                return false;
+            }
+            if (op->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if ((k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0) ||
+                (v->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_Q8_0)) {
+                return false;
+            }
+            if (q->nb[0] != sizeof(float) || op->nb[0] != sizeof(float) ||
+                k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+                return false;
+            }
+            if ((k->type == GGML_TYPE_Q8_0 && (k->ne[0] % 32) != 0) ||
+                (v->type == GGML_TYPE_Q8_0 && (v->ne[0] % 32) != 0)) {
+                return false;
+            }
+            if (k->ne[2] != v->ne[2] || k->ne[3] != v->ne[3] ||
+                k->ne[2] <= 0 || k->ne[3] <= 0 ||
+                (q->ne[2] % k->ne[2]) != 0 || (q->ne[3] % k->ne[3]) != 0) {
+                return false;
+            }
+            if (mask && ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
+                         mask->nb[0] != ggml_type_size(mask->type))) {
+                return false;
+            }
+            if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks))) {
+                return false;
+            }
+            return true;
         }
 
         default:

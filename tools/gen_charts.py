@@ -46,14 +46,14 @@ THEMES = {
 }
 
 PREFILL_DATA = [
-    ("SmolLM2-135M", 46.2, 175.1, 323.9, "54% of .c7m · 3.8x A72"),
+    ("SmolLM2-135M", 46.2, 185.4, 323.9, "57% of .c7m · 4.0x A72"),
     ("Qwen2.5-0.5B", 14.0, 118.3, 168.7, "70% of .c7m · 8.5x A72"),
     ("Qwen3-0.6B",   12.7,  68.1, 104.5, "65% of .c7m · 5.4x A72"),
     ("Qwen2.5-1.5B",  4.9,  63.0,  71.6, "88% of .c7m · 12.8x A72"),
 ]
 
 DECODE_DATA = [
-    ("SmolLM2-135M", 28.6, 47.7, 115.7, "41% of .c7m · 1.7x A72"),
+    ("SmolLM2-135M", 28.6, 55.3, 115.7, "48% of .c7m · 1.9x A72"),
     ("Qwen2.5-0.5B",  8.6, 14.3,  35.1, "41% of .c7m · 1.7x A72"),
     ("Qwen3-0.6B",    7.8, 13.1,  27.2, "48% of .c7m · 1.7x A72"),
     ("Qwen2.5-1.5B",  3.6,  8.3,  11.6, "72% of .c7m · 2.3x A72"),
@@ -208,7 +208,7 @@ def render_non_llm_svg(theme_name: str) -> str:
         )
 
     lines.append(
-        f'<text x="24" y="{h - 14}" class="sans" font-size="11" fill="{t["muted"]}">Plus ggml-c7x Vision/Audio ops on live silicon: test-backend-ops NORM|IM2COL|POOL_2D 710/710 PASS · CONV_2D 1,574/1,574 PASS (2,030/2,030 hostemu)</text>'
+        f'<text x="24" y="{h - 14}" class="sans" font-size="11" fill="{t["muted"]}">Hybrid ONNX (C7x+CPU): mobilenet_e2e 72.3 FPS · whisper_erf 190.6 FPS | ggml-c7x silicon: FLASH_ATTN_EXT 3,648/3,648 · CONV_2D 1,574/1,574 PASS</text>'
     )
     lines.append("</svg>\n")
     return "\n".join(lines)

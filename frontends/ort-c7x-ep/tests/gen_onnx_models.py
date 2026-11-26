@@ -409,12 +409,239 @@ def build_audio_enc_block(out_dir: str):
     with open(os.path.join(out_dir, "audio_ref.bin"), "wb") as f:
         f.write(struct.pack(f"<{len(out)}f", *out))
 
+def build_mobilenet_e2e_hybrid(out_dir: str):
+    """
+    Real-world end-to-end FP32-image-in -> Softmax-probabilities-out MobileNetV2-style CNN:
+      QuantizeLinear (CPU fallback: FP32 [1,3,64,64] -> UINT8)
+      -> C7x Subgraph #1 (9 DSP cmds / 1 RPC):
+           4x QLinearConv (std 3->34 w_zp=-3, DW 34->34, PW 34->64, std 64->128)
+           -> DequantizeLinear -> Relu -> GlobalAveragePool -> Flatten -> Gemm(128->18)
+      -> Softmax (CPU fallback: logits [1,18] -> probabilities)
+    """
+    # Reuse the exact mobilenet_qlinear graph by loading its weights/structure deterministically:
+    rng = Lcg(0xC7E2E001)
+    N, IC0, H0, W0 = 1, 3, 64, 64
+    x_sc, x_zp = 0.02, 128
+    # Realistic normalized FP32 image input in [-2.0, +2.0]
+    x_f32 = [((rng.u8(0, 255) - 128) / 64.0) for _ in range(N * IC0 * H0 * W0)]
+    x_u8 = [clamp(round_even(v / x_sc) + x_zp, 0, 255) for v in x_f32]
+
+    OC1, OC3, OC4, NCLS = 34, 64, 128, 18
+    inits = []
+    nodes = [
+        make_node("QuantizeLinear", ["image_f32", "x_sc", "x_zp"], ["input_u8"], "quant_in"),
+    ]
+
+    w1 = [rng.i8(-40, 40) for _ in range(OC1 * IC0 * 9)]
+    ws1 = [0.008 + 0.0002 * i for i in range(OC1)]
+    b1 = [rng.i8(-20, 20) for _ in range(OC1)]
+    y1_sc, y1_zp = 0.06, -5
+    inits += [
+        make_scalar_f32("x_sc", x_sc), make_scalar_u8("x_zp", x_zp),
+        make_tensor("w1", [OC1, IC0, 3, 3], DT_INT8, struct.pack(f"<{len(w1)}b", *w1)),
+        make_vec_f32("ws1", ws1), make_scalar_i8("w1_zp", -3),
+        make_scalar_f32("y1_sc", y1_sc), make_scalar_i8("y1_zp", y1_zp),
+        make_vec_i32("b1", b1),
+    ]
+    nodes.append(make_node(
+        "QLinearConv",
+        ["input_u8", "x_sc", "x_zp", "w1", "ws1", "w1_zp", "y1_sc", "y1_zp", "b1"],
+        ["c1"], "conv1_stem",
+        [attr_ints("strides", [2, 2]), attr_ints("pads", [1, 1, 1, 1]), attr_int("group", 1)],
+    ))
+
+    w2 = [rng.i8(-40, 40) for _ in range(OC1 * 9)]
+    ws2 = [0.01 + 0.0001 * i for i in range(OC1)]
+    b2 = [rng.i8(-15, 15) for _ in range(OC1)]
+    y2_sc, y2_zp = 0.05, 3
+    inits += [
+        make_tensor("w2", [OC1, 1, 3, 3], DT_INT8, struct.pack(f"<{len(w2)}b", *w2)),
+        make_vec_f32("ws2", ws2), make_scalar_i8("w2_zp", 0),
+        make_scalar_f32("y2_sc", y2_sc), make_scalar_i8("y2_zp", y2_zp),
+        make_vec_i32("b2", b2),
+    ]
+    nodes.append(make_node(
+        "QLinearConv",
+        ["c1", "y1_sc", "y1_zp", "w2", "ws2", "w2_zp", "y2_sc", "y2_zp", "b2"],
+        ["c2"], "conv2_dw",
+        [attr_ints("strides", [2, 2]), attr_ints("pads", [1, 1, 1, 1]), attr_int("group", OC1)],
+    ))
+
+    w3 = [rng.i8(-35, 35) for _ in range(OC3 * OC1)]
+    ws3 = [0.009 + 0.0001 * i for i in range(OC3)]
+    b3 = [rng.i8(-10, 10) for _ in range(OC3)]
+    y3_sc, y3_zp = 0.07, -2
+    inits += [
+        make_tensor("w3", [OC3, OC1, 1, 1], DT_INT8, struct.pack(f"<{len(w3)}b", *w3)),
+        make_vec_f32("ws3", ws3), make_scalar_i8("w3_zp", 0),
+        make_scalar_f32("y3_sc", y3_sc), make_scalar_i8("y3_zp", y3_zp),
+        make_vec_i32("b3", b3),
+    ]
+    nodes.append(make_node(
+        "QLinearConv",
+        ["c2", "y2_sc", "y2_zp", "w3", "ws3", "w3_zp", "y3_sc", "y3_zp", "b3"],
+        ["c3"], "conv3_pw",
+        [attr_ints("strides", [1, 1]), attr_ints("pads", [0, 0, 0, 0]), attr_int("group", 1)],
+    ))
+
+    w4 = [rng.i8(-30, 30) for _ in range(OC4 * OC3 * 9)]
+    ws4 = [0.004 + 0.00005 * i for i in range(OC4)]
+    b4 = [rng.i8(-10, 10) for _ in range(OC4)]
+    y4_sc, y4_zp = 0.08, 0
+    inits += [
+        make_tensor("w4", [OC4, OC3, 3, 3], DT_INT8, struct.pack(f"<{len(w4)}b", *w4)),
+        make_vec_f32("ws4", ws4), make_scalar_i8("w4_zp", 0),
+        make_scalar_f32("y4_sc", y4_sc), make_scalar_i8("y4_zp", y4_zp),
+        make_vec_i32("b4", b4),
+    ]
+    nodes.append(make_node(
+        "QLinearConv",
+        ["c3", "y3_sc", "y3_zp", "w4", "ws4", "w4_zp", "y4_sc", "y4_zp", "b4"],
+        ["c4_q"], "conv4_down",
+        [attr_ints("strides", [2, 2]), attr_ints("pads", [1, 1, 1, 1]), attr_int("group", 1)],
+    ))
+    nodes.append(make_node("DequantizeLinear", ["c4_q", "y4_sc", "y4_zp"], ["c4_f"], "dequant4"))
+    nodes.append(make_node("Relu", ["c4_f"], ["c4_r"], "relu4"))
+    nodes.append(make_node("GlobalAveragePool", ["c4_r"], ["gap"], "gap"))
+    nodes.append(make_node("Flatten", ["gap"], ["flat"], "flat", [attr_int("axis", 1)]))
+
+    w_cls = [rng.f32(0.15) for _ in range(NCLS * OC4)]
+    b_cls = [rng.f32(0.05) for _ in range(NCLS)]
+    inits += [
+        make_tensor("w_cls", [NCLS, OC4], DT_FLOAT, struct.pack(f"<{len(w_cls)}f", *w_cls)),
+        make_vec_f32("b_cls", b_cls),
+    ]
+    nodes.append(make_node("Gemm", ["flat", "w_cls", "b_cls"], ["logits"], "fc", [attr_int("transB", 1)]))
+    nodes.append(make_node("Softmax", ["logits"], ["probs"], "softmax_out", [attr_int("axis", -1)]))
+
+    model_bytes = make_model(
+        "mobilenet_e2e_hybrid",
+        nodes, inits,
+        [make_value_info("image_f32", DT_FLOAT, [N, IC0, H0, W0])],
+        [make_value_info("probs", DT_FLOAT, [N, NCLS])],
+    )
+
+    c1, _, _ = ref_qlinear_conv(x_u8, N, IC0, 64, 64, x_sc, x_zp, True,
+                                w1, OC1, 3, 3, ws1, -3, False,
+                                b1, y1_sc, y1_zp, False, False, False, 2, 2, 1, 1, 1)
+    c2, _, _ = ref_qlinear_conv(c1, N, OC1, 32, 32, y1_sc, y1_zp, False,
+                                w2, OC1, 3, 3, ws2, 0, False,
+                                b2, y2_sc, y2_zp, False, False, False, 2, 2, 1, 1, OC1)
+    c3, _, _ = ref_qlinear_conv(c2, N, OC1, 16, 16, y2_sc, y2_zp, False,
+                                w3, OC3, 1, 1, ws3, 0, False,
+                                b3, y3_sc, y3_zp, False, False, False, 1, 1, 0, 0, 1)
+    c4_q, _, _ = ref_qlinear_conv(c3, N, OC3, 16, 16, y3_sc, y3_zp, False,
+                                  w4, OC4, 3, 3, ws4, 0, False,
+                                  b4, y4_sc, y4_zp, False, False, False, 2, 2, 1, 1, 1)
+    c4_r = [max(0.0, (v - y4_zp) * y4_sc) for v in c4_q]
+    gap = [sum(c4_r[oc * 64 : (oc + 1) * 64]) / 64.0 for oc in range(OC4)]
+    logits = [b_cls[c] + sum(gap[k] * w_cls[c * OC4 + k] for k in range(OC4)) for c in range(NCLS)]
+    m_l = max(logits)
+    exps = [math.exp(v - m_l) for v in logits]
+    s_e = sum(exps)
+    probs = [v / s_e for v in exps]
+
+    with open(os.path.join(out_dir, "mobilenet_e2e_hybrid.onnx"), "wb") as f:
+        f.write(model_bytes)
+    with open(os.path.join(out_dir, "mobilenet_e2e_input.bin"), "wb") as f:
+        f.write(struct.pack(f"<{len(x_f32)}f", *x_f32))
+    with open(os.path.join(out_dir, "mobilenet_e2e_ref.bin"), "wb") as f:
+        f.write(struct.pack(f"<{len(probs)}f", *probs))
+
+def build_whisper_erf_hybrid(out_dir: str):
+    """
+    Whisper-style hybrid audio encoder block using ONNX default exact erf-GELU
+    (approximate="none") and final Softmax — exercises multi-subgraph partitioning:
+      C7x Subgraph #1 (Conv) -> CPU (erf-Gelu) -> C7x Subgraph #2 (LayerNorm + MatMul)
+      -> CPU (erf-Gelu) -> C7x Subgraph #3 (MatMul + Add) -> CPU (Softmax)
+    """
+    rng = Lcg(0xA0D1E7F1)
+    N, C0, H0, W0 = 1, 1, 16, 32
+    OC = 64
+    x_in = [rng.f32(1.0) for _ in range(N * C0 * H0 * W0)]
+    w_c = [rng.f32(0.25) for _ in range(OC * C0 * 3 * 3)]
+    b_c = [rng.f32(0.1) for _ in range(OC)]
+    gamma = [1.0 + rng.f32(0.1) for _ in range(OC)]
+    beta = [rng.f32(0.05) for _ in range(OC)]
+    w_ff1 = [rng.f32(0.12) for _ in range(OC * 128)]
+    w_ff2 = [rng.f32(0.12) for _ in range(128 * OC)]
+
+    inits = [
+        make_tensor("w_c", [OC, C0, 3, 3], DT_FLOAT, struct.pack(f"<{len(w_c)}f", *w_c)),
+        make_vec_f32("b_c", b_c),
+        make_vec_i64("sh_seq", [1, 128, OC]),
+        make_vec_f32("ln_g", gamma),
+        make_vec_f32("ln_b", beta),
+        make_tensor("w_ff1", [OC, 128], DT_FLOAT, struct.pack(f"<{len(w_ff1)}f", *w_ff1)),
+        make_tensor("w_ff2", [128, OC], DT_FLOAT, struct.pack(f"<{len(w_ff2)}f", *w_ff2)),
+    ]
+    nodes = [
+        make_node("Conv", ["mel", "w_c", "b_c"], ["h0"], "mel_conv",
+                  [attr_ints("strides", [2, 2]), attr_ints("pads", [1, 1, 1, 1])]),
+        make_node("Gelu", ["h0"], ["h1"], "gelu0_erf"),  # default approximate="none" -> CPU fallback
+        make_node("Reshape", ["h1", "sh_seq"], ["seq"], "to_seq"),
+        make_node("LayerNormalization", ["seq", "ln_g", "ln_b"], ["ln"], "ln0",
+                  [attr_float("epsilon", 1e-5)]),
+        make_node("MatMul", ["ln", "w_ff1"], ["ff1"], "ff1"),
+        make_node("Gelu", ["ff1"], ["ff1_g"], "gelu1_erf"),  # exact erf -> CPU fallback
+        make_node("MatMul", ["ff1_g", "w_ff2"], ["ff2"], "ff2"),
+        make_node("Add", ["seq", "ff2"], ["res"], "res_add"),
+        make_node("Softmax", ["res"], ["out"], "sm_out", [attr_int("axis", -1)]),
+    ]
+    model_bytes = make_model(
+        "whisper_erf_hybrid",
+        nodes, inits,
+        [make_value_info("mel", DT_FLOAT, [N, C0, H0, W0])],
+        [make_value_info("out", DT_FLOAT, [1, 128, OC])],
+    )
+
+    def gelu_erf(v):
+        return 0.5 * v * (1.0 + math.erf(v / math.sqrt(2.0)))
+
+    OH, OW = 8, 16
+    h1 = [0.0] * (OC * OH * OW)
+    for oc in range(OC):
+        for oy in range(OH):
+            for ox in range(OW):
+                acc = b_c[oc]
+                for ky in range(3):
+                    sy = oy * 2 + ky - 1
+                    for kx in range(3):
+                        sx = ox * 2 + kx - 1
+                        if 0 <= sy < H0 and 0 <= sx < W0:
+                            acc += x_in[sy * W0 + sx] * w_c[(oc * 3 + ky) * 3 + kx]
+                h1[(oc * OH + oy) * OW + ox] = gelu_erf(acc)
+    seq = h1
+    out = [0.0] * len(seq)
+    for t in range(128):
+        row = seq[t * OC : (t + 1) * OC]
+        mean = sum(row) / OC
+        var = sum((v - mean) ** 2 for v in row) / OC
+        inv = 1.0 / math.sqrt(var + 1e-5)
+        ln = [(row[c] - mean) * inv * gamma[c] + beta[c] for c in range(OC)]
+        ff1 = [gelu_erf(sum(ln[k] * w_ff1[k * 128 + j] for k in range(OC))) for j in range(128)]
+        res = [row[c] + sum(ff1[j] * w_ff2[j * OC + c] for j in range(128)) for c in range(OC)]
+        mr = max(res)
+        ex = [math.exp(v - mr) for v in res]
+        se = sum(ex)
+        for c in range(OC):
+            out[t * OC + c] = ex[c] / se
+
+    with open(os.path.join(out_dir, "whisper_erf_hybrid.onnx"), "wb") as f:
+        f.write(model_bytes)
+    with open(os.path.join(out_dir, "whisper_erf_input.bin"), "wb") as f:
+        f.write(struct.pack(f"<{len(x_in)}f", *x_in))
+    with open(os.path.join(out_dir, "whisper_erf_ref.bin"), "wb") as f:
+        f.write(struct.pack(f"<{len(out)}f", *out))
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
     os.makedirs(out_dir, exist_ok=True)
     build_mobilenet_qlinear(out_dir)
     build_audio_enc_block(out_dir)
-    print(f"[gen_onnx_models] generated mobilenet_qlinear.onnx and audio_enc_block.onnx in {out_dir}")
+    build_mobilenet_e2e_hybrid(out_dir)
+    build_whisper_erf_hybrid(out_dir)
+    print(f"[gen_onnx_models] generated 4 ONNX models in {out_dir}")
 
 if __name__ == "__main__":
     main()
