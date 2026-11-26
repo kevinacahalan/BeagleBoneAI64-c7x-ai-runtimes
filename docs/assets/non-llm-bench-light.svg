@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="260" viewBox="0 0 880 260" role="img" aria-label="BeagleBone AI-64 Live Silicon Vision and Audio ONNX Results">
+<defs>
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</defs>
+<rect x="0.5" y="0.5" width="879" height="259" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+<text x="24" y="34" class="sans" font-size="16" font-weight="700" fill="#1f2328">Path 3 (ONNX Vision &amp; Audio) + ggml-c7x Non-LLM Ops on Live TDA4VM Silicon</text>
+<text x="24" y="54" class="sans" font-size="12" fill="#656d76">Single C7X_OP_EXEC_LIST RPC per ONNX graph via ort-c7x-ep · Zero OpenVX / TIDL overhead</text>
+<line x1="24" y1="68" x2="856" y2="68" stroke="#d0d7de" stroke-width="1"/>
+<rect x="24" y="84" width="264" height="136" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<rect x="24" y="84" width="264" height="4" rx="2" fill="#8250df"/>
+<text x="38" y="110" class="mono" font-size="12" font-weight="700" fill="#1f2328">mobilenet_qlinear.onnx</text>
+<text x="38" y="142" class="sans" font-size="24" font-weight="700" fill="#8250df">81.6 FPS</text>
+<text x="38" y="163" class="mono" font-size="11" fill="#1f2328">12.23 ms DSP · 9 cmds / 1 RPC</text>
+<text x="38" y="182" class="sans" font-size="10.5" fill="#656d76">4L INT8/UINT8 QLinearConv + GAP + Gemm</text>
+<text x="38" y="204" class="mono" font-size="11" font-weight="600" fill="#656d76">Accuracy: cos = 1.000000</text>
+<rect x="308" y="84" width="264" height="136" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<rect x="308" y="84" width="264" height="4" rx="2" fill="#0969da"/>
+<text x="322" y="110" class="mono" font-size="12" font-weight="700" fill="#1f2328">audio_enc_block.onnx</text>
+<text x="322" y="142" class="sans" font-size="24" font-weight="700" fill="#0969da">882.6 FPS</text>
+<text x="322" y="163" class="mono" font-size="11" fill="#1f2328">1.13 ms DSP · 7 cmds / 1 RPC</text>
+<text x="322" y="182" class="sans" font-size="10.5" fill="#656d76">Conv 3x3 s=2 + Gelu + LayerNorm + FFN</text>
+<text x="322" y="204" class="mono" font-size="11" font-weight="600" fill="#656d76">Accuracy: max_err = 0.000000</text>
+<rect x="592" y="84" width="264" height="136" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<rect x="592" y="84" width="264" height="4" rx="2" fill="#1a7f37"/>
+<text x="606" y="110" class="mono" font-size="12" font-weight="700" fill="#1f2328">QLinearMatMul 60x256x256</text>
+<text x="606" y="142" class="sans" font-size="24" font-weight="700" fill="#1a7f37">4.75x vs A72</text>
+<text x="606" y="163" class="mono" font-size="11" fill="#1f2328">0.401 ms DSP vs 1.90 ms A72</text>
+<text x="606" y="182" class="sans" font-size="10.5" fill="#656d76">UINT8 x INT8 -&gt; UINT8 · 19.6 GOPS</text>
+<text x="606" y="204" class="mono" font-size="11" font-weight="600" fill="#656d76">Accuracy: max_qdiff = 0 (exact)</text>
+<text x="24" y="246" class="sans" font-size="11" fill="#656d76">Plus ggml-c7x Vision/Audio ops on live silicon: test-backend-ops NORM|IM2COL|POOL_2D 710/710 PASS · CONV_2D 1,574/1,574 PASS (2,030/2,030 hostemu)</text>
+</svg>

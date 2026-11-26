@@ -3,14 +3,14 @@
 # Build C7x AI firmware, x86_64 C7000 host-emulation tests, Linux userspace CLI,
 # and the BeagleBone AI-64 device-tree overlay inside containers.
 #
-#   containers/dsp-cgt/Containerfile  TI C7000 CGT 1.2.0.STS + g++ (host emu)
-#   containers/linux/Containerfile    Debian 13 aarch64 cross-compiler + dtc
+#   platform/containers/dsp-cgt/Containerfile  TI C7000 CGT 1.2.0.STS + g++ (host emu)
+#   platform/containers/linux/Containerfile    Debian 13 aarch64 cross-compiler + dtc
 #
-# Usage: ./beagle-linux/scripts/build.sh [all|dsp|host-test|linux|overlay|bundle]
+# Usage: ./platform/beagle-linux/scripts/build.sh [all|host-test|dsp|libc7x|ggml|ort|linux|overlay|bundle]
 
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 
 IMAGE_LINUX=ai64-linux-userspace
 IMAGE_DSP=c7x-ai-dsp-cgt
@@ -56,30 +56,30 @@ ensure_image() {
 }
 
 build_host_test() {
-	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	ensure_image "$IMAGE_DSP" "$ROOT/platform/containers/dsp-cgt/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_DSP" \
-		make -C dsp C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS host-test
+		make -C runtime/dsp C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS host-test
 }
 
 build_dsp() {
-	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	ensure_image "$IMAGE_DSP" "$ROOT/platform/containers/dsp-cgt/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_DSP" \
-		make -C dsp C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS all
+		make -C runtime/dsp C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS all
 }
 
 build_linux() {
-	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+	ensure_image "$IMAGE_LINUX" "$ROOT/platform/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
-		make -C linux-app clean all
+		make -C frontends/c7x-ai clean all
 }
 
 build_libc7x() {
-	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	ensure_image "$IMAGE_DSP" "$ROOT/platform/containers/dsp-cgt/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_DSP" \
-		make -C libc7x C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu-test
-	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+		make -C runtime/libc7x C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu-test
+	ensure_image "$IMAGE_LINUX" "$ROOT/platform/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
-		make -C libc7x hw
+		make -C runtime/libc7x hw
 }
 
 build_ggml() {
@@ -88,41 +88,41 @@ build_ggml() {
 		echo "skipping ggml-c7x ($llama_dir/ggml/include/ggml.h not found; clone llama.cpp or set LLAMA_DIR)" >&2
 		return 0
 	fi
-	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	ensure_image "$IMAGE_DSP" "$ROOT/platform/containers/dsp-cgt/Containerfile"
 	engine_run -v "$ROOT:/work" -v "$llama_dir:/llama:ro" -w /work "$IMAGE_DSP" \
-		make -C ggml-c7x LLAMA_DIR=/llama C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu
-	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+		make -C frontends/ggml-c7x LLAMA_DIR=/llama C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu
+	ensure_image "$IMAGE_LINUX" "$ROOT/platform/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -v "$llama_dir:/llama:ro" -w /work "$IMAGE_LINUX" \
-		make -C ggml-c7x LLAMA_DIR=/llama hw
+		make -C frontends/ggml-c7x LLAMA_DIR=/llama hw
 }
 
 build_ort() {
-	python3 "$ROOT/ort-c7x-ep/tests/gen_onnx_models.py" "$ROOT/ort-c7x-ep/build-hostemu/models"
-	ensure_image "$IMAGE_DSP" "$ROOT/containers/dsp-cgt/Containerfile"
+	python3 "$ROOT/frontends/ort-c7x-ep/tests/gen_onnx_models.py" "$ROOT/frontends/ort-c7x-ep/build-hostemu/models"
+	ensure_image "$IMAGE_DSP" "$ROOT/platform/containers/dsp-cgt/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_DSP" \
-		make -C ort-c7x-ep C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu-test
-	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+		make -C frontends/ort-c7x-ep C7X_CGT=/opt/ti/ti-cgt-c7000_1.2.0.STS hostemu-test
+	ensure_image "$IMAGE_LINUX" "$ROOT/platform/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
-		make -C ort-c7x-ep hw
+		make -C frontends/ort-c7x-ep hw
 }
 
 build_overlay() {
-	ensure_image "$IMAGE_LINUX" "$ROOT/containers/linux/Containerfile"
+	ensure_image "$IMAGE_LINUX" "$ROOT/platform/containers/linux/Containerfile"
 	engine_run -v "$ROOT:/work" -w /work "$IMAGE_LINUX" \
-		make -C beagle-linux/overlays clean all
+		make -C platform/beagle-linux/overlays clean all
 }
 
 bundle() {
 	local out=$ROOT/out/c7x-ai-beagle f
 	local files=(
-		linux-app/c7x-ai
-		dsp/build/c7x-ai.elf
-		beagle-linux/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo
-		beagle-linux/scripts/install-beagle.sh
+		frontends/c7x-ai/c7x-ai
+		runtime/dsp/build/c7x-ai.elf
+		platform/beagle-linux/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo
+		platform/beagle-linux/scripts/install-beagle.sh
 	)
 	for f in "${files[@]}"; do
 		if [[ ! -f $ROOT/$f ]]; then
-			echo "missing $f. Run ./beagle-linux/scripts/build.sh first." >&2
+			echo "missing $f. Run ./platform/beagle-linux/scripts/build.sh first." >&2
 			exit 1
 		fi
 	done
@@ -131,8 +131,8 @@ bundle() {
 	for f in "${files[@]}"; do
 		cp -p "$ROOT/$f" "$out/"
 	done
-	if [[ -f $ROOT/ggml-c7x/build-aarch64/libggml-c7x.so ]]; then
-		cp -p "$ROOT/ggml-c7x/build-aarch64/libggml-c7x.so" "$out/"
+	if [[ -f $ROOT/frontends/ggml-c7x/build-aarch64/libggml-c7x.so ]]; then
+		cp -p "$ROOT/frontends/ggml-c7x/build-aarch64/libggml-c7x.so" "$out/"
 	fi
 	echo "bundle in $out"
 	echo "  scp -r out/c7x-ai-beagle USER@BOARD:"

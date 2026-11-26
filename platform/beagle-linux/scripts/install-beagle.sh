@@ -6,7 +6,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(cd "$HERE/../.." && pwd)
+ROOT=$(cd "$HERE/../../.." && pwd)
 SRC=${1:-}
 if [[ -z $SRC && -f $HERE/c7x-ai ]]; then
 	SRC=$HERE
@@ -32,9 +32,9 @@ find_artifact() {
 	fi
 }
 
-CLI=$(find_artifact c7x-ai linux-app/c7x-ai)
-FW=$(find_artifact c7x-ai.elf dsp/build/c7x-ai.elf)
-DTBO=$(find_artifact "$OVERLAY" "beagle-linux/overlays/$OVERLAY")
+CLI=$(find_artifact c7x-ai frontends/c7x-ai/c7x-ai)
+FW=$(find_artifact c7x-ai.elf runtime/dsp/build/c7x-ai.elf)
+DTBO=$(find_artifact "$OVERLAY" "platform/beagle-linux/overlays/$OVERLAY")
 
 install -m 0755 "$CLI" /usr/bin/c7x-ai
 install -m 0644 "$FW" /lib/firmware/c7x-ai.elf

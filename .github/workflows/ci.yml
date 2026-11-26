@@ -15,13 +15,15 @@ jobs:
       - name: Build containers, run C7000 host-emulation tests, and compile DSP + Linux + DTBO
         env:
           AI64_CONTAINER_ENGINE: docker
-        run: ./beagle-linux/scripts/build.sh all
+        run: ./platform/beagle-linux/scripts/build.sh all
 
       - name: Verify build artifacts exist
         run: |
-          test -f dsp/build/c7x-ai.elf
-          test -x linux-app/c7x-ai
-          test -f beagle-linux/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo
+          test -f runtime/dsp/build/c7x-ai.elf
+          test -f runtime/libc7x/build-aarch64/libc7x.a
+          test -x frontends/c7x-ai/c7x-ai
+          test -f frontends/ort-c7x-ep/build-aarch64/libort-c7x-ep.so
+          test -f platform/beagle-linux/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo
 
       - name: Set up Python & NumPy for reference / converter self-tests
         uses: actions/setup-python@v5

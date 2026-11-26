@@ -1,6 +1,6 @@
 # Yocto Image (`meta-ai64`)
 
-This directory contains a `kas` configuration and the `meta-ai64` layer to build a minimal Poky Linux 6.18 image (`ai64-demo-image`) with the C7x AI runtime pre-installed: `c7x-ai` (`/usr/bin/c7x-ai`), bare-metal C7x firmware (`/lib/firmware/c7x-ai.elf`), and the DDR tensor arena device-tree overlay (`/boot/firmware/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo`). You do not need `beagle-linux/scripts/build.sh` for a Yocto build.
+This directory contains a `kas` configuration and the `meta-ai64` layer to build a minimal Poky Linux 6.18 image (`ai64-demo-image`) with the C7x AI runtime pre-installed: `c7x-ai` (`/usr/bin/c7x-ai`), bare-metal C7x firmware (`/lib/firmware/c7x-ai.elf`), and the DDR tensor arena device-tree overlay (`/boot/firmware/overlays/k3-j721e-beagleboneai64-c7x-ai.dtbo`). You do not need `platform/beagle-linux/scripts/build.sh` for a Yocto build.
 
 ## Layout
 
@@ -15,7 +15,7 @@ A first build takes roughly **3 hours** on a 16-thread host and needs about **15
 ```bash
 wget -O kas-container https://raw.githubusercontent.com/siemens/kas/5.5/kas-container
 chmod +x kas-container
-KAS_BUILD_DIR=yocto/build ./kas-container build yocto/kas/ai64-poky.yml
+KAS_BUILD_DIR=platform/yocto/build ./kas-container build platform/yocto/kas/ai64-poky.yml
 ```
 
 Both `podman` and `docker` work. Set `KAS_CONTAINER_ENGINE=podman` or `KAS_CONTAINER_ENGINE=docker` to choose explicitly (unset, `kas-container` prefers Docker if installed, otherwise Podman). `kas-container build` does not write to an SD card.
@@ -25,7 +25,7 @@ Both `podman` and `docker` work. Set `KAS_CONTAINER_ENGINE=podman` or `KAS_CONTA
 Write the timestamped `.wic.xz` image to a microSD card (verify `/dev/sdX` with `lsblk` first):
 
 ```bash
-xz -dc yocto/build/deploy-ti/images/beaglebone-ai64/ai64-demo-image-beaglebone-ai64.rootfs-<timestamp>.wic.xz \
+xz -dc platform/yocto/build/deploy-ti/images/beaglebone-ai64/ai64-demo-image-beaglebone-ai64.rootfs-<timestamp>.wic.xz \
   | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 

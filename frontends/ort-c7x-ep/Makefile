@@ -7,7 +7,7 @@ AR_AARCH64  ?= aarch64-linux-gnu-ar
 CXX_HOST    ?= g++
 AR_HOST     ?= ar
 
-INC_FLAGS   := -Iinclude -Isrc -I../libc7x/include -I../dsp/include
+INC_FLAGS   := -Iinclude -Isrc -I../../runtime/libc7x/include -I../../runtime/dsp/include
 COMMON_CXX  := -O2 -fPIC -std=c++17 -Wall -Wextra $(INC_FLAGS)
 
 BUILD_HW    := build-aarch64
@@ -19,32 +19,32 @@ all: hw
 
 hw: $(BUILD_HW)/libort-c7x-ep.so $(BUILD_HW)/test_ort_c7x_ep
 
-$(BUILD_HW)/c7x_ort_ep.o: src/c7x_ort_ep.cpp src/onnx_proto.hpp include/c7x_ort_ep.h ../libc7x/include/c7x_rt.h ../dsp/include/c7x_cmd_proto.h
+$(BUILD_HW)/c7x_ort_ep.o: src/c7x_ort_ep.cpp src/onnx_proto.hpp include/c7x_ort_ep.h ../../runtime/libc7x/include/c7x_rt.h ../../runtime/dsp/include/c7x_cmd_proto.h
 	mkdir -p $(BUILD_HW)
 	$(CXX_AARCH64) $(COMMON_CXX) -c -o $@ $<
 
-$(BUILD_HW)/libort-c7x-ep.so: $(BUILD_HW)/c7x_ort_ep.o ../libc7x/build-aarch64/libc7x.a
-	$(CXX_AARCH64) $(COMMON_CXX) -shared -o $@ $(BUILD_HW)/c7x_ort_ep.o ../libc7x/build-aarch64/libc7x.a -lpthread -lm
+$(BUILD_HW)/libort-c7x-ep.so: $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a
+	$(CXX_AARCH64) $(COMMON_CXX) -shared -o $@ $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a -lpthread -lm
 
-$(BUILD_HW)/test_ort_c7x_ep: tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../libc7x/build-aarch64/libc7x.a
-	$(CXX_AARCH64) $(COMMON_CXX) tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../libc7x/build-aarch64/libc7x.a -lpthread -lm -o $@
+$(BUILD_HW)/test_ort_c7x_ep: tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a
+	$(CXX_AARCH64) $(COMMON_CXX) tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a -lpthread -lm -o $@
 
 hostemu: $(BUILD_EMU)/libort-c7x-ep.so $(BUILD_EMU)/test_ort_c7x_ep
 
-$(BUILD_EMU)/c7x_ort_ep.o: src/c7x_ort_ep.cpp src/onnx_proto.hpp include/c7x_ort_ep.h ../libc7x/include/c7x_rt.h ../dsp/include/c7x_cmd_proto.h
+$(BUILD_EMU)/c7x_ort_ep.o: src/c7x_ort_ep.cpp src/onnx_proto.hpp include/c7x_ort_ep.h ../../runtime/libc7x/include/c7x_rt.h ../../runtime/dsp/include/c7x_cmd_proto.h
 	mkdir -p $(BUILD_EMU)
 	$(CXX_HOST) $(COMMON_CXX) -c -o $@ $<
 
-$(BUILD_EMU)/libort-c7x-ep.so: $(BUILD_EMU)/c7x_ort_ep.o ../libc7x/build-hostemu/libc7x_hostemu.a
+$(BUILD_EMU)/libort-c7x-ep.so: $(BUILD_EMU)/c7x_ort_ep.o ../../runtime/libc7x/build-hostemu/libc7x_hostemu.a
 	@if [ -z "$(C7X_CGT)" ]; then echo "C7X_CGT is not set" >&2; exit 1; fi
 	$(CXX_HOST) $(COMMON_CXX) -shared -o $@ $(BUILD_EMU)/c7x_ort_ep.o \
-		../libc7x/build-hostemu/libc7x_hostemu.a \
+		../../runtime/libc7x/build-hostemu/libc7x_hostemu.a \
 		$(C7X_CGT)/host_emulation/libc70-host-emulation.a -lpthread -lm
 
-$(BUILD_EMU)/test_ort_c7x_ep: tests/test_ort_c7x_ep.cpp $(BUILD_EMU)/c7x_ort_ep.o ../libc7x/build-hostemu/libc7x_hostemu.a
+$(BUILD_EMU)/test_ort_c7x_ep: tests/test_ort_c7x_ep.cpp $(BUILD_EMU)/c7x_ort_ep.o ../../runtime/libc7x/build-hostemu/libc7x_hostemu.a
 	@if [ -z "$(C7X_CGT)" ]; then echo "C7X_CGT is not set" >&2; exit 1; fi
 	$(CXX_HOST) $(COMMON_CXX) tests/test_ort_c7x_ep.cpp $(BUILD_EMU)/c7x_ort_ep.o \
-		../libc7x/build-hostemu/libc7x_hostemu.a \
+		../../runtime/libc7x/build-hostemu/libc7x_hostemu.a \
 		$(C7X_CGT)/host_emulation/libc70-host-emulation.a -lpthread -lm -o $@
 
 hostemu-test: $(BUILD_EMU)/test_ort_c7x_ep

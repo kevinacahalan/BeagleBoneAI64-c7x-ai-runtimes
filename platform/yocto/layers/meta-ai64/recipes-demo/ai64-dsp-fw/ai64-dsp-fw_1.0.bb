@@ -5,10 +5,10 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 DEPENDS = "ti-cgt-dsp-native"
 
-FILESEXTRAPATHS:prepend := "${@os.path.abspath(os.path.join(os.path.dirname(d.getVar('FILE')), '..', '..', '..', '..', '..'))}/:"
+FILESEXTRAPATHS:prepend := "${@os.path.abspath(os.path.join(os.path.dirname(d.getVar('FILE')), '..', '..', '..', '..', '..', '..'))}/:"
 
 SRC_URI = " \
-    file://dsp;subdir=src \
+    file://runtime/dsp;subdir=src \
 "
 
 S = "${UNPACKDIR}/src"
@@ -20,16 +20,16 @@ INSANE_SKIP:${PN} += "arch buildpaths"
 do_configure[noexec] = "1"
 
 do_compile () {
-    rm -rf ${S}/dsp/build
-    oe_runmake -C ${S}/dsp \
+    rm -rf ${S}/runtime/dsp/build
+    oe_runmake -C ${S}/runtime/dsp \
         C7X_CGT="${STAGING_DATADIR_NATIVE}/ti-cgt-c7x" \
         all
-    test -f ${S}/dsp/build/c7x-ai.elf
+    test -f ${S}/runtime/dsp/build/c7x-ai.elf
 }
 
 do_install () {
     install -d ${D}${nonarch_base_libdir}/firmware
-    install -m 0644 ${S}/dsp/build/c7x-ai.elf ${D}${nonarch_base_libdir}/firmware/c7x-ai.elf
+    install -m 0644 ${S}/runtime/dsp/build/c7x-ai.elf ${D}${nonarch_base_libdir}/firmware/c7x-ai.elf
 }
 
 FILES:${PN} = "${nonarch_base_libdir}/firmware/c7x-ai.elf"
