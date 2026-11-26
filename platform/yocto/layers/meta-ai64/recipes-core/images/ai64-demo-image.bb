@@ -1,11 +1,12 @@
 SUMMARY = "BeagleBone AI-64 C7x AI runtime image"
-DESCRIPTION = "Minimal systemd image for BeagleBone AI-64 with the C7x AI runtime, c7x-ai host CLI, and DDR tensor arena overlay."
+DESCRIPTION = "Minimal systemd image for BeagleBone AI-64 with the C7x AI runtime, c7x-ai host CLI, libc7x + ort-c7x-ep ONNX EP and models, and DDR tensor arena overlay."
 
 require recipes-core/images/core-image-minimal.bb
 
 IMAGE_INSTALL:append = " \
     ai64-demo \
     ai64-dsp-fw \
+    c7x-ort-ep \
     ai64-boot \
     ai64-sysconf \
     bb-usb-gadgets \

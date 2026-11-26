@@ -21,14 +21,14 @@ all: hw
 # ----------------------------------------------------------------------------
 # aarch64 hardware library (uses /dev/mem + c7x_ctrl)
 # ----------------------------------------------------------------------------
-HW_CFLAGS := -O2 -fPIC -std=c11 $(WARN_FLAGS) $(INC_FLAGS) -DLIBC7X_ENABLE_HW
+HW_CFLAGS := -O2 -fPIC -std=c11 $(WARN_FLAGS) $(INC_FLAGS) -DLIBC7X_ENABLE_HW $(EXTRA_CFLAGS)
 HW_OBJS   := $(BUILD_HW)/c7x_rt.o $(BUILD_HW)/c7x_pack.o $(BUILD_HW)/c7x_transport_hw.o
 
 hw: $(BUILD_HW)/libc7x.a $(BUILD_HW)/test_libc7x
 
 $(BUILD_HW)/test_libc7x: tests/test_libc7x.c $(BUILD_HW)/libc7x.a
 	mkdir -p $(BUILD_HW)
-	$(CC_AARCH64) $(HW_CFLAGS) tests/test_libc7x.c $(BUILD_HW)/libc7x.a -lpthread -lm -o $@
+	$(CC_AARCH64) $(HW_CFLAGS) $(LDFLAGS) tests/test_libc7x.c $(BUILD_HW)/libc7x.a -lpthread -lm -o $@
 
 $(BUILD_HW)/%.o: src/%.c include/c7x_rt.h src/c7x_internal.h ../dsp/include/c7x_ai_proto.h ../dsp/include/c7x_cmd_proto.h
 	mkdir -p $(BUILD_HW)
