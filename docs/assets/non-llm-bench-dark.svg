@@ -30,5 +30,5 @@
 <text x="606" y="163" class="mono" font-size="11" fill="#e6edf3">0.401 ms DSP vs 1.90 ms A72</text>
 <text x="606" y="182" class="sans" font-size="10.5" fill="#8b949e">UINT8 x INT8 -&gt; UINT8 · 19.6 GOPS</text>
 <text x="606" y="204" class="mono" font-size="11" font-weight="600" fill="#8b949e">Accuracy: max_qdiff = 0 (exact)</text>
-<text x="24" y="246" class="sans" font-size="11" fill="#8b949e">Plus ggml-c7x Vision/Audio ops on live silicon: test-backend-ops NORM|IM2COL|POOL_2D 710/710 PASS · CONV_2D 1,574/1,574 PASS (2,030/2,030 hostemu)</text>
+<text x="24" y="246" class="sans" font-size="11" fill="#8b949e">Hybrid ONNX (C7x+CPU): mobilenet_e2e 72.3 FPS · whisper_erf 190.6 FPS | ggml-c7x silicon: FLASH_ATTN_EXT 3,648/3,648 · CONV_2D 1,574/1,574 PASS</text>
 </svg>

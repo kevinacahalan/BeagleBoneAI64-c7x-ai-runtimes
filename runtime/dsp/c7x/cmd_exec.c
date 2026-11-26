@@ -358,50 +358,101 @@ static void dequant_row_q8_0(const uint8_t *src, float *dst, uint32_t n)
 {
 	uint32_t nb = n / 32u;
 	uint32_t b, j;
+	int32_t itmp[16] __attribute__((aligned(64)));
+	float ftmp[16]   __attribute__((aligned(64)));
 
 	for (b = 0u; b < nb; b++) {
 		const uint8_t *blk = src + (uint64_t)b * 34ull;
 		uint16_t dh = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
 		float d = cmd_f16_to_f32(dh);
+		float16 dv = (float16)d;
 		const int8_t *qs = (const int8_t *)(blk + 2u);
 		float *out = dst + b * 32u;
+		uint32_t half;
 
-		for (j = 0u; j < 32u; j++) {
-			out[j] = (float)qs[j] * d;
+		for (half = 0u; half < 32u; half += 16u) {
+			for (j = 0u; j < 16u; j++) {
+				itmp[j] = (int32_t)qs[half + j];
+			}
+			{
+				float16 fv = __int_to_float(*(__int16_ptr)itmp) * dv;
+				float *dp = out + half;
+				if ((((uintptr_t)dp) & 63u) == 0u) {
+					*(__float16_ptr)dp = fv;
+				} else {
+					*(__float16_ptr)ftmp = fv;
+					memcpy(dp, ftmp, 16u * sizeof(float));
+				}
+			}
 		}
 	}
+}
+
+static float dot_q8_0_f32(const float *a, const uint8_t *b_q8, uint32_t k)
+{
+	uint32_t nb = k / 32u;
+	uint32_t b, j;
+	float sum = 0.0f;
+	int32_t itmp[16] __attribute__((aligned(64)));
+	float ftmp[16]   __attribute__((aligned(64)));
+
+	for (b = 0u; b < nb; b++) {
+		const uint8_t *blk = b_q8 + (uint64_t)b * 34ull;
+		uint16_t dh = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+		float d = cmd_f16_to_f32(dh);
+		const int8_t *qs = (const int8_t *)(blk + 2u);
+		const float *ap = a + b * 32u;
+		float16 acc = (float16)0.0f;
+		uint32_t half;
+
+		for (half = 0u; half < 32u; half += 16u) {
+			for (j = 0u; j < 16u; j++) {
+				itmp[j] = (int32_t)qs[half + j];
+			}
+			memcpy(ftmp, ap + half, 16u * sizeof(float));
+			acc += *(__float16_ptr)ftmp * __int_to_float(*(__int16_ptr)itmp);
+		}
+		sum += cmd_hsum_f16(acc) * d;
+	}
+	return sum;
 }
 
 static void quant_row_q8_0(const float *src, uint8_t *dst, uint32_t n)
 {
 	uint32_t nb = n / 32u;
 	uint32_t b, j;
+	float ftmp0[16]  __attribute__((aligned(64)));
+	float ftmp1[16]  __attribute__((aligned(64)));
+	int32_t qtmp[16] __attribute__((aligned(64)));
 
 	for (b = 0u; b < nb; b++) {
 		const float *in = src + b * 32u;
 		uint8_t *blk = dst + (uint64_t)b * 34ull;
-		float amax = 0.0f;
-		float d, id;
+		float amax, d, id;
 		uint16_t dh;
 		int8_t *qs = (int8_t *)(blk + 2u);
+		float16 v0, v1, av;
 
-		for (j = 0u; j < 32u; j++) {
-			float v = in[j] < 0.0f ? -in[j] : in[j];
-			if (v > amax) {
-				amax = v;
-			}
-		}
+		memcpy(ftmp0, in,       16u * sizeof(float));
+		memcpy(ftmp1, in + 16u, 16u * sizeof(float));
+		v0 = *(__float16_ptr)ftmp0;
+		v1 = *(__float16_ptr)ftmp1;
+		av = __max(__max(v0, -v0), __max(v1, -v1));
+		amax = cmd_hmax_f16(av);
+
 		d = amax / 127.0f;
 		id = (d != 0.0f) ? (1.0f / d) : 0.0f;
 		dh = cmd_f32_to_f16(d);
 		blk[0] = (uint8_t)(dh & 0xFFu);
 		blk[1] = (uint8_t)(dh >> 8);
-		for (j = 0u; j < 32u; j++) {
-			float scaled = in[j] * id;
-			int32_t q = (int32_t)(scaled >= 0.0f ? (scaled + 0.5f) : (scaled - 0.5f));
-			if (q > 127) q = 127;
-			if (q < -127) q = -127;
-			qs[j] = (int8_t)q;
+		{
+			float16 idv = (float16)id;
+			int16 q0 = __min(__max(__float_to_int(v0 * idv), (int16)(-127)), (int16)127);
+			int16 q1 = __min(__max(__float_to_int(v1 * idv), (int16)(-127)), (int16)127);
+			*(__int16_ptr)qtmp = q0;
+			for (j = 0u; j < 16u; j++) qs[j] = (int8_t)qtmp[j];
+			*(__int16_ptr)qtmp = q1;
+			for (j = 0u; j < 16u; j++) qs[16u + j] = (int8_t)qtmp[j];
 		}
 	}
 }
@@ -791,15 +842,46 @@ static void l2_matvec_f32(const float *a_l2, const float *b_l2,
 	__SE0_CLOSE();
 }
 
-/* Stage n rows x k_copy elements of DDR/MSMC F16 or F32 into 64B-aligned L2 F32 [n][k_pad16]. */
+/* Stage n rows x k_copy elements of DDR/MSMC F16, Q8_0, or F32 into 64B-aligned L2 F32 [n][k_pad16]. */
 static void stage_src0_to_l2(const uint8_t *p0_base, uint64_t nb01,
 			     uint32_t n, uint32_t k_copy, uint32_t k_pad16,
-			     uint32_t k_row_cap, int src0_f16, float *b_l2)
+			     uint32_t k_row_cap, int src0_fmt, float *b_l2)
 {
 	uint32_t k_vec = k_copy & ~15u;
 	uint32_t in, ik;
 
-	if (src0_f16) {
+	if (src0_fmt == 2) {
+		/* GGML Q8_0 (34 bytes per 32 elements): dequantize only active 32-element blocks. */
+		uint32_t k_q32 = (k_copy + 31u) & ~31u;
+		if (k_q32 > k_row_cap) k_q32 = k_row_cap;
+		for (in = 0u; in < n; in++) {
+			const uint8_t *sq = p0_base + (uint64_t)in * nb01;
+			float *dst = b_l2 + (uint64_t)in * k_pad16;
+			if (k_q32 <= k_pad16) {
+				dequant_row_q8_0(sq, dst, k_q32);
+				for (ik = k_copy; ik < k_pad16; ik++) {
+					dst[ik] = 0.0f;
+				}
+			} else {
+				/* Last partial 32-elem block straddles k_pad16 (k_copy <= k_pad16 < k_q32). */
+				float blk32[32] __attribute__((aligned(64)));
+				uint32_t full = k_q32 - 32u;
+				if (full > 0u) {
+					dequant_row_q8_0(sq, dst, full);
+				}
+				dequant_row_q8_0(sq + (uint64_t)(full / 32u) * 34ull, blk32, 32u);
+				for (ik = full; ik < k_copy; ik++) {
+					dst[ik] = blk32[ik - full];
+				}
+				for (ik = k_copy; ik < k_pad16; ik++) {
+					dst[ik] = 0.0f;
+				}
+			}
+		}
+		return;
+	}
+
+	if (src0_fmt == 1) {
 		if (k_pad16 > 0u && k_pad16 <= k_row_cap && (nb01 % sizeof(uint16_t)) == 0u &&
 		    nb01 <= 0x7FFFFFFFull) {
 			/*
@@ -871,8 +953,10 @@ static int exec_matmul_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t
 	uint8_t       *dst  = (uint8_t *)(uintptr_t)cmd->dst;
 	const struct c7x_matmul_f32_desc *d =
 		(const struct c7x_matmul_f32_desc *)(uintptr_t)cmd->src3;
-	int src0_f16 = (cmd->flags & C7X_CMD_FLAG_SRC0_F16) ? 1 : 0;
-	uint32_t elem0 = src0_f16 ? (uint32_t)sizeof(uint16_t) : (uint32_t)sizeof(float);
+	int src0_f16  = (cmd->flags & C7X_CMD_FLAG_SRC0_F16)  ? 1 : 0;
+	int src0_q8_0 = (cmd->flags & C7X_CMD_FLAG_SRC0_Q8_0) ? 1 : 0;
+	int src0_fmt  = src0_q8_0 ? 2 : (src0_f16 ? 1 : 0);
+	uint32_t elem0 = src0_q8_0 ? 34u : (src0_f16 ? (uint32_t)sizeof(uint16_t) : (uint32_t)sizeof(float));
 	uint32_t k, n, m, b2, b3, r2, r3;
 	uint32_t i3, i02, r_i2, im, in;
 
@@ -886,6 +970,9 @@ static int exec_matmul_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t
 	b3 = d->ne1[3];
 	if (d->ne1[0] != k || d->ne0[2] == 0u || d->ne0[3] == 0u) {
 		return -2;
+	}
+	if (src0_q8_0 && ((k & 31u) != 0u || d->nb0[0] != 34ull)) {
+		return -3;
 	}
 	r2 = b2 / d->ne0[2];
 	r3 = b3 / d->ne0[3];
@@ -947,7 +1034,7 @@ static int exec_matmul_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t
 					float *b_l2 = (float *)((uint8_t *)l2_scratch + a_bytes);
 					uint32_t k_v = k_pad16 >> 4;
 
-					stage_src0_to_l2(p0_base, d->nb0[1], n, k_max, k_pad16, k, src0_f16, b_l2);
+					stage_src0_to_l2(p0_base, d->nb0[1], n, k_max, k_pad16, k, src0_fmt, b_l2);
 
 					for (r_i2 = 0u; r_i2 < r2; r_i2++) {
 						uint32_t i2 = i02 * r2 + r_i2;
@@ -982,7 +1069,7 @@ static int exec_matmul_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t
 					for (n0 = 0u; n0 < n; n0 += n_chunk) {
 						uint32_t nc = (n - n0 < n_chunk) ? (n - n0) : n_chunk;
 						stage_src0_to_l2(p0_base + (uint64_t)n0 * d->nb0[1],
-								 d->nb0[1], nc, k_max, k_pad16, k, src0_f16, b_l2);
+								 d->nb0[1], nc, k_max, k_pad16, k, src0_fmt, b_l2);
 						for (r_i2 = 0u; r_i2 < r2; r_i2++) {
 							uint32_t i2 = i02 * r2 + r_i2;
 							const uint8_t *p1_base;
@@ -1016,7 +1103,11 @@ static int exec_matmul_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t
 					for (im = 0u; im < m; im++) {
 						const float *a = (const float *)(p1_base + (uint64_t)im * d->nb1[1]);
 						float       *o = (float *)(pd_base + (uint64_t)im * d->nb_dst[1]);
-						if (src0_f16) {
+						if (src0_q8_0) {
+							for (in = 0u; in < n; in++) {
+								o[in] = dot_q8_0_f32(a, p0_base + (uint64_t)in * d->nb0[1], k);
+							}
+						} else if (src0_f16) {
 							for (in = 0u; in < n; in++) {
 								o[in] = dot_f16_f32(a, (const uint16_t *)(p0_base + (uint64_t)in * d->nb0[1]), k_max);
 							}
@@ -1029,8 +1120,11 @@ static int exec_matmul_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t
 				}
 			}
 		}
-		cmd_l1d_wbinv_after_l2_scratch();
 		return 0;
+	}
+
+	if (src0_q8_0) {
+		return -4;
 	}
 
 	for (i3 = 0u; i3 < b3; i3++) {
@@ -1721,7 +1815,7 @@ static int exec_rope_f32(const struct c7x_cmd *cmd)
 		(const struct c7x_rope_desc *)(uintptr_t)cmd->src3;
 	uint32_t ne0, ne1, ne2, ne3, n_dims;
 	int is_neox;
-	float theta_scale, corr_dims[2];
+	float theta_scale = 1.0f, corr_dims[2];
 	uint32_t i3, i2, i1, i0;
 
 	if (!src0 || !pos || !dst || !d) {
@@ -1737,65 +1831,150 @@ static int exec_rope_f32(const struct c7x_cmd *cmd)
 		return -2;
 	}
 
-	theta_scale = powf(d->freq_base, -2.0f / (float)n_dims);
-	corr_dims[0] = 0.0f;
-	corr_dims[1] = 0.0f;
-	if (d->ext_factor != 0.0f) {
-		rope_yarn_corr_dims((int)n_dims, (int)d->n_ctx_orig, d->freq_base,
-				    d->beta_fast, d->beta_slow, d->truncate, corr_dims);
-	}
-
 	{
-		float freq_tab[128] __attribute__((aligned(64)));
-		float c_tab[128]    __attribute__((aligned(64)));
-		float s_tab[128]    __attribute__((aligned(64)));
+		struct rope_freq_key {
+			uint32_t n_dims;
+			uint32_t n_ctx_orig;
+			int32_t  truncate;
+			float    freq_base;
+			float    freq_scale;
+			float    ext_factor;
+			float    beta_fast;
+			float    beta_slow;
+			float    attn_factor;
+		};
+		static struct rope_freq_key g_rope_fkey;
+		static int g_rope_fvalid = 0;
+		static float g_rope_freq_tab[128] __attribute__((aligned(64)));
+		static float g_rope_mscale = 1.0f;
+		static int g_rope_scvalid = 0;
+		static int32_t g_rope_sc_pos = 0;
+		static float g_rope_c_tab[128] __attribute__((aligned(64)));
+		static float g_rope_s_tab[128] __attribute__((aligned(64)));
+
+		float freq_tab_local[128] __attribute__((aligned(64)));
+		float c_tab_local[128]    __attribute__((aligned(64)));
+		float s_tab_local[128]    __attribute__((aligned(64)));
+		float *freq_tab = freq_tab_local;
+		float *c_tab    = c_tab_local;
+		float *s_tab    = s_tab_local;
 		uint32_t n_pairs = n_dims >> 1;
 		int use_tab = (n_pairs <= 128u);
+		int can_cache = (use_tab && ff == NULL);
 		float mscale_base = d->attn_factor;
 
-		if (d->ext_factor != 0.0f) {
-			mscale_base *= (1.0f + 0.1f * logf(1.0f / d->freq_scale));
-		}
-		if (use_tab) {
-			float tb = 1.0f;
-			uint32_t k_pad16 = (n_pairs + 15u) & ~15u;
-			for (i0 = 0u; i0 < n_pairs; i0++) {
-				float inv_freq = ff ? (1.0f / ff[i0]) : 1.0f;
-				float f_extrap = tb * inv_freq;
-				float f_interp = d->freq_scale * f_extrap;
-				float f_eff = f_interp;
+		if (can_cache) {
+			struct rope_freq_key fk;
+			memset(&fk, 0, sizeof(fk));
+			fk.n_dims      = n_dims;
+			fk.n_ctx_orig  = d->n_ctx_orig;
+			fk.truncate    = d->truncate;
+			fk.freq_base   = d->freq_base;
+			fk.freq_scale  = d->freq_scale;
+			fk.ext_factor  = d->ext_factor;
+			fk.beta_fast   = d->beta_fast;
+			fk.beta_slow   = d->beta_slow;
+			fk.attn_factor = d->attn_factor;
+
+			if (g_rope_fvalid && memcmp(&fk, &g_rope_fkey, sizeof(fk)) == 0) {
+				freq_tab    = g_rope_freq_tab;
+				mscale_base = g_rope_mscale;
+			} else {
+				float tb = 1.0f;
+				uint32_t k_pad16 = (n_pairs + 15u) & ~15u;
+
+				theta_scale = powf(d->freq_base, -2.0f / (float)n_dims);
+				corr_dims[0] = 0.0f;
+				corr_dims[1] = 0.0f;
 				if (d->ext_factor != 0.0f) {
-					float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int)(i0 * 2u)) * d->ext_factor;
-					f_eff = f_interp * (1.0f - ramp_mix) + f_extrap * ramp_mix;
+					rope_yarn_corr_dims((int)n_dims, (int)d->n_ctx_orig, d->freq_base,
+							    d->beta_fast, d->beta_slow, d->truncate, corr_dims);
+					mscale_base *= (1.0f + 0.1f * logf(1.0f / d->freq_scale));
 				}
-				freq_tab[i0] = f_eff;
-				tb *= theta_scale;
+				for (i0 = 0u; i0 < n_pairs; i0++) {
+					float f_extrap = tb;
+					float f_interp = d->freq_scale * f_extrap;
+					float f_eff = f_interp;
+					if (d->ext_factor != 0.0f) {
+						float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int)(i0 * 2u)) * d->ext_factor;
+						f_eff = f_interp * (1.0f - ramp_mix) + f_extrap * ramp_mix;
+					}
+					g_rope_freq_tab[i0] = f_eff;
+					tb *= theta_scale;
+				}
+				for (; i0 < k_pad16 && i0 < 128u; i0++) {
+					g_rope_freq_tab[i0] = 0.0f;
+				}
+				g_rope_fkey    = fk;
+				g_rope_mscale  = mscale_base;
+				g_rope_fvalid  = 1;
+				g_rope_scvalid = 0;
+				freq_tab       = g_rope_freq_tab;
 			}
-			for (; i0 < k_pad16 && i0 < 128u; i0++) {
-				freq_tab[i0] = 0.0f;
+		} else {
+			theta_scale = powf(d->freq_base, -2.0f / (float)n_dims);
+			corr_dims[0] = 0.0f;
+			corr_dims[1] = 0.0f;
+			if (d->ext_factor != 0.0f) {
+				rope_yarn_corr_dims((int)n_dims, (int)d->n_ctx_orig, d->freq_base,
+						    d->beta_fast, d->beta_slow, d->truncate, corr_dims);
+				mscale_base *= (1.0f + 0.1f * logf(1.0f / d->freq_scale));
+			}
+			if (use_tab) {
+				float tb = 1.0f;
+				uint32_t k_pad16 = (n_pairs + 15u) & ~15u;
+				for (i0 = 0u; i0 < n_pairs; i0++) {
+					float inv_freq = ff ? (1.0f / ff[i0]) : 1.0f;
+					float f_extrap = tb * inv_freq;
+					float f_interp = d->freq_scale * f_extrap;
+					float f_eff = f_interp;
+					if (d->ext_factor != 0.0f) {
+						float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int)(i0 * 2u)) * d->ext_factor;
+						f_eff = f_interp * (1.0f - ramp_mix) + f_extrap * ramp_mix;
+					}
+					freq_tab[i0] = f_eff;
+					tb *= theta_scale;
+				}
+				for (; i0 < k_pad16 && i0 < 128u; i0++) {
+					freq_tab[i0] = 0.0f;
+				}
 			}
 		}
 
 		for (i3 = 0u; i3 < ne3; i3++) {
 			for (i2 = 0u; i2 < ne2; i2++) {
-				float p = (float)pos[i2];
+				int32_t p_i32 = pos[i2];
+				float p = (float)p_i32;
 
-				/* Compute 16 (sin, cos) pairs at once via vectorized Cody-Waite polynomial. */
+				/* Compute 16 (sin, cos) pairs at once via vectorized Cody-Waite polynomial (or reuse cache!). */
 				if (use_tab) {
-					if (fabsf(p) <= 100000.0f) {
-						float16 pv = (float16)p;
-						float16 mv = (float16)mscale_base;
-						uint32_t k_pad16 = (n_pairs + 15u) & ~15u;
-						for (i0 = 0u; i0 < k_pad16; i0 += 16u) {
-							float16 th = pv * *(__float16_ptr)&freq_tab[i0];
-							cmd_vsincos_store_f16(th, mv, &s_tab[i0], &c_tab[i0]);
-						}
+					if (can_cache && g_rope_scvalid && g_rope_sc_pos == p_i32) {
+						c_tab = g_rope_c_tab;
+						s_tab = g_rope_s_tab;
 					} else {
-						for (i0 = 0u; i0 < n_pairs; i0++) {
-							float th = p * freq_tab[i0];
-							c_tab[i0] = cosf(th) * mscale_base;
-							s_tab[i0] = sinf(th) * mscale_base;
+						float *cd = can_cache ? g_rope_c_tab : c_tab_local;
+						float *sd = can_cache ? g_rope_s_tab : s_tab_local;
+						if (fabsf(p) <= 100000.0f) {
+							float16 pv = (float16)p;
+							float16 mv = (float16)mscale_base;
+							uint32_t k_pad16 = (n_pairs + 15u) & ~15u;
+							for (i0 = 0u; i0 < k_pad16; i0 += 16u) {
+								float16 th = pv * *(__float16_ptr)&freq_tab[i0];
+								cmd_vsincos_store_f16(th, mv, &sd[i0], &cd[i0]);
+							}
+						} else {
+							for (i0 = 0u; i0 < n_pairs; i0++) {
+								float th = p * freq_tab[i0];
+								cd[i0] = cosf(th) * mscale_base;
+								sd[i0] = sinf(th) * mscale_base;
+							}
 						}
+						if (can_cache) {
+							g_rope_sc_pos  = p_i32;
+							g_rope_scvalid = 1;
+						}
+						c_tab = cd;
+						s_tab = sd;
 					}
 				}
 
@@ -2729,7 +2908,6 @@ static int exec_conv_2d_f32(const struct c7x_cmd *cmd, void *l2_scratch, uint32_
 						}
 					}
 				}
-				cmd_l1d_wbinv_after_l2_scratch();
 				return 0;
 			}
 		}
@@ -3049,7 +3227,6 @@ static int exec_qlinear_matmul(const struct c7x_cmd *cmd, void *l2_scratch, uint
 		}
 	}
 
-	cmd_l1d_wbinv_after_l2_scratch();
 	return 0;
 }
 
@@ -3249,7 +3426,6 @@ static int exec_qlinear_conv2d(const struct c7x_cmd *cmd, void *l2_scratch, uint
 		}
 	}
 
-	cmd_l1d_wbinv_after_l2_scratch();
 	return 0;
 }
 
@@ -3324,6 +3500,427 @@ static int exec_dequantize_linear(const struct c7x_cmd *cmd)
 	return 0;
 }
 
+static inline int fa_dtype_to_stage_fmt(uint32_t dt)
+{
+	if (dt == C7X_DTYPE_Q8_0) return 2;
+	if (dt == C7X_DTYPE_F16)  return 1;
+	return 0;
+}
+
+/* Accumulate acc[0..dv_pad16-1] = acc * alpha + sum_{c=0..bc-1} w[c] * v_l2[c][0..dv_pad16-1] */
+static void fa_accum_v_l2(float *acc_l2, const float *v_l2, const float *w,
+			  uint32_t bc, uint32_t dv_v, float alpha)
+{
+	uint32_t c, v;
+	uint32_t dv_pad16 = dv_v << 4;
+
+	if (dv_v == 4u) {
+		float16 a0, a1, a2, a3;
+		if (alpha == 0.0f) {
+			a0 = a1 = a2 = a3 = (float16)0.0f;
+		} else if (alpha == 1.0f) {
+			a0 = *(__float16_ptr)(acc_l2);
+			a1 = *(__float16_ptr)(acc_l2 + 16u);
+			a2 = *(__float16_ptr)(acc_l2 + 32u);
+			a3 = *(__float16_ptr)(acc_l2 + 48u);
+		} else {
+			float16 av = (float16)alpha;
+			a0 = *(__float16_ptr)(acc_l2) * av;
+			a1 = *(__float16_ptr)(acc_l2 + 16u) * av;
+			a2 = *(__float16_ptr)(acc_l2 + 32u) * av;
+			a3 = *(__float16_ptr)(acc_l2 + 48u) * av;
+		}
+		for (c = 0u; c < bc; c++) {
+			float wc = w[c];
+			if (wc != 0.0f) {
+				float16 wv = (float16)wc;
+				const float *vr = v_l2 + (uint64_t)c * 64u;
+				a0 += wv * *(__float16_ptr)(float *)(vr);
+				a1 += wv * *(__float16_ptr)(float *)(vr + 16u);
+				a2 += wv * *(__float16_ptr)(float *)(vr + 32u);
+				a3 += wv * *(__float16_ptr)(float *)(vr + 48u);
+			}
+		}
+		*(__float16_ptr)(acc_l2)       = a0;
+		*(__float16_ptr)(acc_l2 + 16u) = a1;
+		*(__float16_ptr)(acc_l2 + 32u) = a2;
+		*(__float16_ptr)(acc_l2 + 48u) = a3;
+		return;
+	}
+	if (dv_v == 8u) {
+		float16 a0, a1, a2, a3, a4, a5, a6, a7;
+		if (alpha == 0.0f) {
+			a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = (float16)0.0f;
+		} else if (alpha == 1.0f) {
+			a0 = *(__float16_ptr)(acc_l2);
+			a1 = *(__float16_ptr)(acc_l2 + 16u);
+			a2 = *(__float16_ptr)(acc_l2 + 32u);
+			a3 = *(__float16_ptr)(acc_l2 + 48u);
+			a4 = *(__float16_ptr)(acc_l2 + 64u);
+			a5 = *(__float16_ptr)(acc_l2 + 80u);
+			a6 = *(__float16_ptr)(acc_l2 + 96u);
+			a7 = *(__float16_ptr)(acc_l2 + 112u);
+		} else {
+			float16 av = (float16)alpha;
+			a0 = *(__float16_ptr)(acc_l2) * av;
+			a1 = *(__float16_ptr)(acc_l2 + 16u) * av;
+			a2 = *(__float16_ptr)(acc_l2 + 32u) * av;
+			a3 = *(__float16_ptr)(acc_l2 + 48u) * av;
+			a4 = *(__float16_ptr)(acc_l2 + 64u) * av;
+			a5 = *(__float16_ptr)(acc_l2 + 80u) * av;
+			a6 = *(__float16_ptr)(acc_l2 + 96u) * av;
+			a7 = *(__float16_ptr)(acc_l2 + 112u) * av;
+		}
+		for (c = 0u; c < bc; c++) {
+			float wc = w[c];
+			if (wc != 0.0f) {
+				float16 wv = (float16)wc;
+				const float *vr = v_l2 + (uint64_t)c * 128u;
+				a0 += wv * *(__float16_ptr)(float *)(vr);
+				a1 += wv * *(__float16_ptr)(float *)(vr + 16u);
+				a2 += wv * *(__float16_ptr)(float *)(vr + 32u);
+				a3 += wv * *(__float16_ptr)(float *)(vr + 48u);
+				a4 += wv * *(__float16_ptr)(float *)(vr + 64u);
+				a5 += wv * *(__float16_ptr)(float *)(vr + 80u);
+				a6 += wv * *(__float16_ptr)(float *)(vr + 96u);
+				a7 += wv * *(__float16_ptr)(float *)(vr + 112u);
+			}
+		}
+		*(__float16_ptr)(acc_l2)        = a0;
+		*(__float16_ptr)(acc_l2 + 16u)  = a1;
+		*(__float16_ptr)(acc_l2 + 32u)  = a2;
+		*(__float16_ptr)(acc_l2 + 48u)  = a3;
+		*(__float16_ptr)(acc_l2 + 64u)  = a4;
+		*(__float16_ptr)(acc_l2 + 80u)  = a5;
+		*(__float16_ptr)(acc_l2 + 96u)  = a6;
+		*(__float16_ptr)(acc_l2 + 112u) = a7;
+		return;
+	}
+
+	if (alpha == 0.0f) {
+		for (v = 0u; v < dv_v; v++) {
+			*(__float16_ptr)(acc_l2 + (v << 4)) = (float16)0.0f;
+		}
+	} else if (alpha != 1.0f) {
+		float16 av = (float16)alpha;
+		for (v = 0u; v < dv_v; v++) {
+			*(__float16_ptr)(acc_l2 + (v << 4)) *= av;
+		}
+	}
+	for (c = 0u; c < bc; c++) {
+		float wc = w[c];
+		if (wc != 0.0f) {
+			float16 wv = (float16)wc;
+			const float *vr = v_l2 + (uint64_t)c * dv_pad16;
+			for (v = 0u; v < dv_v; v++) {
+				*(__float16_ptr)(acc_l2 + (v << 4)) += wv * *(__float16_ptr)(float *)(vr + (v << 4));
+			}
+		}
+	}
+}
+
+static int exec_flash_attn_ext(const struct c7x_cmd *cmd, void *l2_scratch, uint32_t l2_bytes)
+{
+	const uint8_t *q_base = (const uint8_t *)(uintptr_t)cmd->src0;
+	const uint8_t *k_base = (const uint8_t *)(uintptr_t)cmd->src1;
+	const uint8_t *v_base = (const uint8_t *)(uintptr_t)cmd->src2;
+	uint8_t       *dst    = (uint8_t *)(uintptr_t)cmd->dst;
+	const struct c7x_flash_attn_desc *d =
+		(const struct c7x_flash_attn_desc *)(uintptr_t)cmd->src3;
+	const uint8_t *mask_base  = d && d->mask_addr  ? (const uint8_t *)(uintptr_t)d->mask_addr  : NULL;
+	const float   *sinks_base = d && d->sinks_addr ? (const float *)(uintptr_t)d->sinks_addr   : NULL;
+	uint32_t DK, DV, N, n_kv, n_head, b3, rk2, rk3, rv2, rv3;
+	uint32_t dk_pad16, dv_pad16, dk_v, dv_v;
+	int k_fmt, v_fmt, mask_f16;
+	float scale_eff;
+	uint32_t b_kv, q_chunk;
+	float *q_l2, *scores_l2, *acc_l2, *m_arr, *s_arr, *k_l2, *v_l2;
+	uint32_t iq3, ik2;
+
+	if (!q_base || !k_base || !v_base || !dst || !d || !l2_scratch) {
+		return -1;
+	}
+	DK     = d->neq[0];
+	N      = d->neq[1];
+	n_head = d->neq[2];
+	b3     = d->neq[3];
+	n_kv   = d->nek[1];
+	DV     = d->nev[0];
+	if (DK == 0u || DV == 0u || N == 0u || n_head == 0u || b3 == 0u ||
+	    d->nek[0] != DK || d->nev[1] != n_kv ||
+	    d->nek[2] == 0u || d->nek[3] == 0u || d->nev[2] == 0u || d->nev[3] == 0u) {
+		return -2;
+	}
+	if ((d->k_dtype == C7X_DTYPE_Q8_0 && (DK & 31u) != 0u) ||
+	    (d->v_dtype == C7X_DTYPE_Q8_0 && (DV & 31u) != 0u)) {
+		return -3;
+	}
+
+	rk2 = n_head / d->nek[2]; if (rk2 == 0u) rk2 = 1u;
+	rk3 = b3     / d->nek[3]; if (rk3 == 0u) rk3 = 1u;
+	rv2 = n_head / d->nev[2]; if (rv2 == 0u) rv2 = 1u;
+	rv3 = b3     / d->nev[3]; if (rv3 == 0u) rv3 = 1u;
+	if (rk2 != rv2 || rk3 != rv3 || (n_head % d->nek[2]) != 0u || (b3 % d->nek[3]) != 0u) {
+		return -4;
+	}
+
+	k_fmt    = fa_dtype_to_stage_fmt(d->k_dtype);
+	v_fmt    = fa_dtype_to_stage_fmt(d->v_dtype);
+	mask_f16 = (d->mask_dtype == C7X_DTYPE_F16) ? 1 : 0;
+	scale_eff = (d->logit_softcap != 0.0f) ? (d->scale / d->logit_softcap) : d->scale;
+
+	dk_pad16 = (DK + 15u) & ~15u;
+	dv_pad16 = (DV + 15u) & ~15u;
+	dk_v     = dk_pad16 >> 4;
+	dv_v     = dv_pad16 >> 4;
+
+	/* Partition L2 scratchpad: q_l2 + acc_l2 + scores_l2 + M/S arrays + K/V tiles. */
+	q_chunk = (N < 32u) ? N : 32u;
+	while (q_chunk > 1u && (uint64_t)q_chunk * rk2 > 256u) {
+		q_chunk >>= 1;
+	}
+	{
+		uint32_t q_bytes   = CMD_ALIGN64(dk_pad16 * (uint32_t)sizeof(float));
+		uint32_t acc_bytes = CMD_ALIGN64(dv_pad16 * (uint32_t)sizeof(float));
+		uint32_t ms_cnt    = q_chunk * rk2;
+		uint32_t ms_bytes  = CMD_ALIGN64(ms_cnt * (uint32_t)sizeof(float));
+		uint32_t sc_bytes  = CMD_ALIGN64(256u * (uint32_t)sizeof(float));
+		uint32_t fixed     = q_bytes + acc_bytes + 2u * ms_bytes + sc_bytes;
+		uint32_t row_bytes = (dk_pad16 + dv_pad16) * (uint32_t)sizeof(float);
+
+		if (l2_bytes <= fixed + row_bytes) {
+			return -5;
+		}
+		b_kv = (l2_bytes - fixed) / row_bytes;
+		if (b_kv > 256u) b_kv = 256u;
+		if (b_kv == 0u) return -5;
+
+		{
+			uint8_t *p = (uint8_t *)l2_scratch;
+			q_l2      = (float *)p; p += q_bytes;
+			acc_l2    = (float *)p; p += acc_bytes;
+			scores_l2 = (float *)p; p += sc_bytes;
+			m_arr     = (float *)p; p += ms_bytes;
+			s_arr     = (float *)p; p += ms_bytes;
+			k_l2      = (float *)p; p += CMD_ALIGN64(b_kv * dk_pad16 * (uint32_t)sizeof(float));
+			v_l2      = (float *)p;
+		}
+	}
+
+	for (iq3 = 0u; iq3 < b3; iq3++) {
+		uint32_t ik3 = iq3 / rk3;
+		for (ik2 = 0u; ik2 < d->nek[2]; ik2++) {
+			const uint8_t *k_head = k_base + (uint64_t)ik3 * d->nbk[3] + (uint64_t)ik2 * d->nbk[2];
+			const uint8_t *v_head = v_base + (uint64_t)ik3 * d->nbv[3] + (uint64_t)ik2 * d->nbv[2];
+			uint32_t q0;
+
+			for (q0 = 0u; q0 < N; q0 += q_chunk) {
+				uint32_t qc = (N - q0 < q_chunk) ? (N - q0) : q_chunk;
+				uint32_t ic_min = 0u, ic_max = n_kv;
+				uint32_t r_i2, qi, ic0;
+
+				/* Zero running accumulators and init M = -INF, S = 0. */
+				for (r_i2 = 0u; r_i2 < rk2; r_i2++) {
+					uint32_t iq2 = ik2 * rk2 + r_i2;
+					for (qi = 0u; qi < qc; qi++) {
+						uint32_t iq1 = q0 + qi;
+						uint32_t slot = r_i2 * qc + qi;
+						float *dp = (float *)(dst + ((uint64_t)iq3 * N * n_head +
+									     (uint64_t)iq2 + (uint64_t)iq1 * n_head) * d->nb_dst[1]);
+						m_arr[slot] = -INFINITY;
+						s_arr[slot] = 0.0f;
+						memset(dp, 0, (size_t)DV * sizeof(float));
+					}
+				}
+
+				/* Tighten active KV range [ic_min, ic_max) using mask if present! */
+				if (mask_base && n_kv > 0u) {
+					uint32_t found_min = n_kv, found_max = 0u;
+					for (r_i2 = 0u; r_i2 < rk2; r_i2++) {
+						uint32_t iq2 = ik2 * rk2 + r_i2;
+						uint32_t m2 = d->nem[2] ? (iq2 % d->nem[2]) : 0u;
+						uint32_t m3 = d->nem[3] ? (iq3 % d->nem[3]) : 0u;
+						if (r_i2 > 0u && d->nem[2] <= 1u) break;
+						for (qi = 0u; qi < qc; qi++) {
+							uint32_t iq1 = q0 + qi;
+							const uint8_t *mp = mask_base + (uint64_t)iq1 * d->nbm[1] +
+									    (uint64_t)m2 * d->nbm[2] + (uint64_t)m3 * d->nbm[3];
+							uint32_t c;
+							if (mask_f16) {
+								const uint16_t *m16 = (const uint16_t *)mp;
+								for (c = 0u; c < found_min; c++) {
+									if (m16[c] != 0xFC00u) { found_min = c; break; }
+								}
+								for (c = n_kv; c > found_max; c--) {
+									if (m16[c - 1u] != 0xFC00u) { found_max = c; break; }
+								}
+							} else {
+								const float *m32 = (const float *)mp;
+								for (c = 0u; c < found_min; c++) {
+									if (m32[c] != -INFINITY) { found_min = c; break; }
+								}
+								for (c = n_kv; c > found_max; c--) {
+									if (m32[c - 1u] != -INFINITY) { found_max = c; break; }
+								}
+							}
+						}
+					}
+					ic_min = found_min;
+					ic_max = found_max;
+				}
+
+				/* Tile active KV tokens in blocks of b_kv, staging K & V into L2 SRAM ONCE per block! */
+				for (ic0 = ic_min; ic0 < ic_max; ic0 += b_kv) {
+					uint32_t bc = (ic_max - ic0 < b_kv) ? (ic_max - ic0) : b_kv;
+
+					stage_src0_to_l2(k_head + (uint64_t)ic0 * d->nbk[1], d->nbk[1],
+							 bc, DK, dk_pad16, DK, k_fmt, k_l2);
+					stage_src0_to_l2(v_head + (uint64_t)ic0 * d->nbv[1], d->nbv[1],
+							 bc, DV, dv_pad16, DV, v_fmt, v_l2);
+
+					for (r_i2 = 0u; r_i2 < rk2; r_i2++) {
+						uint32_t iq2 = ik2 * rk2 + r_i2;
+						float slope = 1.0f;
+						uint32_t m2 = d->nem[2] ? (iq2 % d->nem[2]) : 0u;
+						uint32_t m3 = d->nem[3] ? (iq3 % d->nem[3]) : 0u;
+
+						if (d->max_bias > 0.0f) {
+							float base = (iq2 < d->n_head_log2) ? d->m0 : d->m1;
+							int32_t exp_i = (iq2 < d->n_head_log2)
+									? (int32_t)(iq2 + 1u)
+									: (int32_t)(2u * (iq2 - d->n_head_log2) + 1u);
+							slope = powf(base, (float)exp_i);
+						}
+
+						for (qi = 0u; qi < qc; qi++) {
+							uint32_t iq1 = q0 + qi;
+							uint32_t slot = r_i2 * qc + qi;
+							const float *pq = (const float *)(q_base + (uint64_t)iq1 * d->nbq[1] +
+											  (uint64_t)iq2 * d->nbq[2] +
+											  (uint64_t)iq3 * d->nbq[3]);
+							float *dp = (float *)(dst + ((uint64_t)iq3 * N * n_head +
+										     (uint64_t)iq2 + (uint64_t)iq1 * n_head) * d->nb_dst[1]);
+							const uint8_t *mp = mask_base
+									    ? (mask_base + (uint64_t)iq1 * d->nbm[1] +
+									       (uint64_t)m2 * d->nbm[2] + (uint64_t)m3 * d->nbm[3])
+									    : NULL;
+							uint32_t c, bc_vec;
+							float tile_max = -INFINITY;
+							float m_old, m_new, alpha, s_tile;
+
+							memcpy(q_l2, pq, (size_t)DK * sizeof(float));
+							for (c = DK; c < dk_pad16; c++) q_l2[c] = 0.0f;
+
+							l2_matvec_f32(q_l2, k_l2, dk_v, bc, scores_l2);
+
+							/* Apply scale, optional softcap, optional mask, and find tile_max. */
+							for (c = 0u; c < bc; c++) {
+								float mv = 0.0f;
+								if (mp) {
+									float raw_m = mask_f16
+										      ? cmd_f16_to_f32(((const uint16_t *)mp)[ic0 + c])
+										      : ((const float *)mp)[ic0 + c];
+									mv = (raw_m == -INFINITY) ? -INFINITY : (slope * raw_m);
+								}
+								if (mv == -INFINITY) {
+									scores_l2[c] = -INFINITY;
+								} else {
+									float sc = scores_l2[c] * scale_eff;
+									if (d->logit_softcap != 0.0f) {
+										sc = d->logit_softcap * tanhf(sc);
+									}
+									sc += mv;
+									scores_l2[c] = sc;
+									if (sc > tile_max) tile_max = sc;
+								}
+							}
+
+							if (tile_max == -INFINITY) {
+								continue;
+							}
+
+							m_old = m_arr[slot];
+							m_new = (tile_max > m_old) ? tile_max : m_old;
+							if (m_old == -INFINITY) {
+								alpha = 0.0f;
+							} else if (m_new == m_old) {
+								alpha = 1.0f;
+							} else {
+								alpha = cmd_expf_scalar(m_old - m_new);
+							}
+
+							/* Vectorized exp(scores - m_new) and sum S_tile. */
+							bc_vec = bc & ~15u;
+							s_tile = 0.0f;
+							c = 0u;
+							if (bc_vec >= 16u) {
+								float16 mv_v = (float16)m_new;
+								float16 sum_v = (float16)0.0f;
+								for (; c < bc_vec; c += 16u) {
+									float16 sv = *(__float16_ptr)&scores_l2[c];
+									float16 ev = cmd_vexpf_f16(sv - mv_v);
+									*(__float16_ptr)&scores_l2[c] = ev;
+									sum_v += ev;
+								}
+								s_tile = cmd_hsum_f16(sum_v);
+							}
+							for (; c < bc; c++) {
+								float sv = scores_l2[c];
+								float ev = (sv == -INFINITY) ? 0.0f : cmd_expf_scalar(sv - m_new);
+								scores_l2[c] = ev;
+								s_tile += ev;
+							}
+
+							if (alpha != 0.0f) {
+								memcpy(acc_l2, dp, (size_t)DV * sizeof(float));
+								for (c = DV; c < dv_pad16; c++) acc_l2[c] = 0.0f;
+							}
+							fa_accum_v_l2(acc_l2, v_l2, scores_l2, bc, dv_v, alpha);
+							memcpy(dp, acc_l2, (size_t)DV * sizeof(float));
+
+							m_arr[slot] = m_new;
+							s_arr[slot] = s_arr[slot] * alpha + s_tile;
+						}
+					}
+				}
+
+				/* Finalize sinks and divide by S for every query in this chunk. */
+				for (r_i2 = 0u; r_i2 < rk2; r_i2++) {
+					uint32_t iq2 = ik2 * rk2 + r_i2;
+					for (qi = 0u; qi < qc; qi++) {
+						uint32_t iq1 = q0 + qi;
+						uint32_t slot = r_i2 * qc + qi;
+						float *dp = (float *)(dst + ((uint64_t)iq3 * N * n_head +
+									     (uint64_t)iq2 + (uint64_t)iq1 * n_head) * d->nb_dst[1]);
+						float M = m_arr[slot];
+						float S = s_arr[slot];
+						float scale_out;
+						uint32_t c;
+
+						if (sinks_base) {
+							float sv = sinks_base[iq2];
+							float ms = 1.0f, vs = 1.0f;
+							if (sv > M) {
+								ms = (M == -INFINITY) ? 0.0f : cmd_expf_scalar(M - sv);
+								M = sv;
+								for (c = 0u; c < DV; c++) dp[c] *= ms;
+							} else {
+								vs = cmd_expf_scalar(sv - M);
+							}
+							S = S * ms + vs;
+						}
+						scale_out = (S == 0.0f) ? 0.0f : (1.0f / S);
+						for (c = 0u; c < DV; c++) {
+							dp[c] *= scale_out;
+						}
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Command-list entry point                                                   */
 /* -------------------------------------------------------------------------- */
@@ -3333,6 +3930,7 @@ int c7x_cmd_exec_list(const struct c7x_cmd *cmds, uint32_t n_cmds,
 		      uint32_t *done_out, uint32_t *fail_idx_out)
 {
 	uint32_t i;
+	int l2_dirty = 0;
 
 	if (done_out) *done_out = 0u;
 	if (fail_idx_out) *fail_idx_out = 0u;
@@ -3349,13 +3947,31 @@ int c7x_cmd_exec_list(const struct c7x_cmd *cmds, uint32_t n_cmds,
 			rc = 0;
 			break;
 		case C7X_CMD_MATMUL_W4A8_G64:
+			/*
+			 * Only flush dirty L1D lines covering l2_scratch right before DRU0 DMA
+			 * is actually going to write into l2_scratch (DDR weights >= 1 MiB for m=1
+			 * or >= 128 KiB for m>1). SE0 snoops L1D, so non-DRU commands need zero flush.
+			 */
+			if (l2_dirty && (cmd->flags & C7X_CMD_FLAG_USE_DRU) && cmd->src0 >= 0x80000000ull) {
+				uint64_t kp = CMD_ALIGN64(cmd->p1);
+				uint64_t np = CMD_ALIGN64(cmd->p2);
+				uint64_t wb = (np >> 6) * (kp >> 6) * 2048ull;
+				uint64_t min_dru = (cmd->p0 == 1u) ? (1024ull * 1024ull) : (128ull * 1024ull);
+				if (wb >= min_dru) {
+					cmd_l1d_wbinv_after_l2_scratch();
+					l2_dirty = 0;
+				}
+			}
 			rc = exec_matmul_w4a8_g64(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		case C7X_CMD_MATMUL_W8A8:
 			rc = exec_matmul_w8a8(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		case C7X_CMD_MATMUL_F32:
 			rc = exec_matmul_f32(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		case C7X_CMD_RMS_NORM_F32:
 			rc = exec_rms_norm_f32(cmd);
@@ -3401,15 +4017,22 @@ int c7x_cmd_exec_list(const struct c7x_cmd *cmds, uint32_t n_cmds,
 			break;
 		case C7X_CMD_CONV_2D_F32:
 			rc = exec_conv_2d_f32(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		case C7X_CMD_QLINEAR_MATMUL:
 			rc = exec_qlinear_matmul(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		case C7X_CMD_QLINEAR_CONV2D:
 			rc = exec_qlinear_conv2d(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		case C7X_CMD_DEQUANTIZE_LIN:
 			rc = exec_dequantize_linear(cmd);
+			break;
+		case C7X_CMD_FLASH_ATTN_EXT:
+			rc = exec_flash_attn_ext(cmd, l2_scratch, l2_bytes);
+			l2_dirty = 1;
 			break;
 		default:
 			rc = -100;
@@ -3417,12 +4040,18 @@ int c7x_cmd_exec_list(const struct c7x_cmd *cmds, uint32_t n_cmds,
 		}
 
 		if (rc != 0) {
+			if (l2_dirty) {
+				cmd_l1d_wbinv_after_l2_scratch();
+			}
 			if (done_out) *done_out = i;
 			if (fail_idx_out) *fail_idx_out = i;
 			return rc;
 		}
 	}
 
+	if (l2_dirty) {
+		cmd_l1d_wbinv_after_l2_scratch();
+	}
 	if (done_out) *done_out = n_cmds;
 	return 0;
 }
