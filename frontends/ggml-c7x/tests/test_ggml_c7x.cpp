@@ -98,7 +98,7 @@ static int test_weight_roundtrip_and_partial_write(ggml_backend_t c7x) {
 }
 
 static int test_tied_get_rows_and_mul_mat_first_graph(ggml_backend_t c7x) {
-    // Same Q4_0 WEIGHTS tensor used by GET_ROWS then MUL_MAT in one graph (Claude C1!)
+    // Same Q4_0 WEIGHTS tensor used by GET_ROWS then MUL_MAT in one graph
     const int64_t K = 128, V = 64;
     std::vector<float> wf(V * K);
     for (auto & v : wf) v = randf();
@@ -159,7 +159,7 @@ static int test_set_rows_oob_and_cpy_gating(ggml_backend_t c7x) {
     struct ggml_init_params ip { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
     struct ggml_context * ctx = ggml_init(ip);
 
-    // 1. Check CPY I32 <-> F32 is rejected by supports_op (Claude I5)
+    // 1. Check CPY I32 <-> F32 is rejected by supports_op
     struct ggml_tensor * a_i32 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 64);
     struct ggml_tensor * b_f32 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
     struct ggml_tensor * bad_cpy1 = ggml_cpy(ctx, a_i32, b_f32);
@@ -167,7 +167,7 @@ static int test_set_rows_oob_and_cpy_gating(ggml_backend_t c7x) {
     bool cpy_ok = !ggml_backend_dev_supports_op(ggml_backend_get_device(c7x), bad_cpy1) &&
                   !ggml_backend_dev_supports_op(ggml_backend_get_device(c7x), bad_cpy2);
 
-    // 2. Check SET_ROWS with OOB index fails safely (Claude I4)
+    // 2. Check SET_ROWS with OOB index fails safely
     struct ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
     struct ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 1);
     struct ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
@@ -189,7 +189,7 @@ static int test_set_rows_oob_and_cpy_gating(ggml_backend_t c7x) {
 }
 
 static int test_cmdbuf_auto_flush_4200_ops(ggml_backend_t c7x) {
-    // Chain 4,200 ADD ops (> 4,096 cmdbuf capacity!) to verify seamless chunked flushing (Claude I11)
+    // Chain 4,200 ADD ops (> 4,096 cmdbuf capacity) to verify seamless chunked flushing
     const int N_OPS = 4200;
     const int LEN = 16;
     struct ggml_init_params ip {

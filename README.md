@@ -193,6 +193,18 @@ docs/                         OS_SETUP.md, MEMORY.md, NOTES.md, RESULTS.md, and 
 
 ---
 
+## Suggested Automation Setup
+
+You only need a BeagleBone AI-64, a microSD card, and SSH to use this repo. If you plan to do heavy firmware/kernel iteration, automated testing, or AI-agent-driven hardware bring-up, a few inexpensive bench tools make the loop completely hands-free:
+
+- **USB-controlled power relay** (e.g., a 5 V USB serial/HID relay inline with the board's power supply, or a networked smart PDU): lets scripts or agents cleanly power-cycle the board after a DSP fault, kernel hang, or bad boot edit without physically unplugging power.
+- **USB SD card multiplexer (SD-MUX)** (e.g., Linux Automation USB-SD-Mux or equivalent): switches the microSD card between your host PC and the BeagleBone AI-64 under software control so automation can reflash Debian/Yocto images, edit `extlinux.conf`/`sysconf.txt`, and recover unbootable images unattended.
+- **3.3 V USB-to-UART serial adapter** wired to the debug console (`ttyS2`, `115200 8N1`): captures U-Boot output, device-tree overlay errors, and early kernel panics before Ethernet/SSH comes up.
+- **Wired Ethernet + SSH key auth:** keeps model transfers and test loops fast and deterministic (put the Yocto passwordless-root dev image on an isolated bench network).
+- **Local bench notes (git-ignored):** `local-info/` is pre-listed in `.gitignore` as a convenient place to keep your machine-specific board IP, SSH alias, serial port, relay command, and SD-MUX notes for local scripts or coding agents without committing personal setup details.
+
+---
+
 ## Credits & License
 
 Originally forked from [`BeagleBoneAI64-linux-zephyr-pru-c7x-c66x-demo`](https://github.com/kevinacahalan/BeagleBoneAI64-linux-zephyr-pru-c7x-c66x-demo).

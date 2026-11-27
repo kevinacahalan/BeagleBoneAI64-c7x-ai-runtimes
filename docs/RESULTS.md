@@ -256,7 +256,7 @@ Measured on the **exact same live BeagleBone AI-64 board** (dual Cortex-A72 @ 2.
 
 ## Milestone 7: Out-of-Tree `llama.cpp` Dynamic Backend (`libggml-c7x.so`) & `libc7x` Command-Buffer Runtime
 
-Built an out-of-tree, zero-fork dynamic GGML backend plugin (`ggml-c7x/libggml-c7x.so`, loaded at runtime via `GGML_BACKEND_PATH` into unmodified `GGML_BACKEND_DL=ON` `llama.cpp`) over the new reusable `libc7x` runtime and `C7X_OP_EXEC_LIST` flat command-buffer executor. Runs real `Q4_0`, `Q4_1`, `Q5_0`, `Q5_K`, `Q6_K`, `Q8_0`, `Q4_K_M`, `F16`, and `F32` GGUFs directly on the C7x + MMA with a single `EXEC_LIST` RPC per forward pass (`graph splits = 2`, 100% transformer layers + LM head offloaded).
+Built an out-of-tree, zero-fork dynamic GGML backend plugin (`frontends/ggml-c7x/build-aarch64/libggml-c7x.so`, loaded at runtime via `GGML_BACKEND_PATH` into unmodified `GGML_BACKEND_DL=ON` `llama.cpp`) over the new reusable `libc7x` runtime and `C7X_OP_EXEC_LIST` flat command-buffer executor. Runs real `Q4_0`, `Q4_1`, `Q5_0`, `Q5_K`, `Q6_K`, `Q8_0`, `Q4_K_M`, `F16`, and `F32` GGUFs directly on the C7x + MMA with a single `EXEC_LIST` RPC per forward pass (`graph splits = 2`, 100% transformer layers + LM head offloaded).
 
 ### 1. Live BeagleBone AI-64 Correctness Verification
 
@@ -303,7 +303,7 @@ Extended the exact same `C7X_OP_EXEC_LIST` + `libc7x` command-buffer stack beyon
 
 ### 2. Live BeagleBone AI-64 ONNX Runtime Execution Provider (`ort-c7x-ep`) Results
 
-Zero-dependency standard `.onnx` binary protobuf loader & compiler (`ort-c7x-ep/libort-c7x-ep.so`) lowering full multi-layer ONNX graphs into a **single `C7X_OP_EXEC_LIST` RPC** with strict ONNX-exact `QLinearConv`/`QLinearMatMul` + standalone `DequantizeLinear` semantics:
+Zero-dependency standard `.onnx` binary protobuf loader & compiler (`frontends/ort-c7x-ep/build-aarch64/libort-c7x-ep.so`) lowering full multi-layer ONNX graphs into a **single `C7X_OP_EXEC_LIST` RPC** with strict ONNX-exact `QLinearConv`/`QLinearMatMul` + standalone `DequantizeLinear` semantics:
 
 | ONNX Workload | Graph Summary | Commands / RPC | Accuracy vs Reference | C7x DSP Latency | Wall Latency | Throughput / vs A72 |
 | --- | --- | ---: | --- | ---: | ---: | --- |
@@ -326,9 +326,9 @@ Added `C7X_CMD_FLASH_ATTN_EXT` (`GGML_OP_FLASH_ATTN_EXT`, L2-staged active-mask 
 
 | `SmolLM2-135M Q4_0` Mode (Live Silicon, `llama-bench -ngl 99`) | KV Cache | `pp128` (`tok/s`) | `tg32` (`tok/s`) | vs 2T A72 (`46.19` / `28.62`) | Notes |
 | --- | --- | ---: | ---: | ---: | --- |
-| Pre-PR-#2 `ggml-c7x` (`-fa 0`) | F16 | `175.07` | `47.71` | `3.79×` / `1.67×` | `665` cmds/tok, `16.58 ms` DSP |
-| **PR #2 `ggml-c7x` (`-fa 1`, stock default)** | **F16** | **`185.40 ± 0.01`** | **`54.71 – 55.34`** | **`4.01×` / `1.93×`** | `514` cmds/tok, **`12.20 ms` DSP (`+16.0%` decode)** |
-| **PR #2 `ggml-c7x` (`-fa 1 -ctk q8_0 -ctv q8_0`)** | **`Q8_0` (2× smaller)** | **`151.55 ± 0.03`** | **`49.00 ± 0.01`** | **`3.28×` / `1.71×`** | Halves KV RAM while still beating pre-PR-#2 F16 decode |
+| Baseline `ggml-c7x` (`-fa 0`, no FA2/fusion) | F16 | `175.07` | `47.71` | `3.79×` / `1.67×` | `665` cmds/tok, `16.58 ms` DSP |
+| **`ggml-c7x` with FA2 + fusion (`-fa 1`, default)** | **F16** | **`185.40 ± 0.01`** | **`54.71 – 55.34`** | **`4.01×` / `1.93×`** | `514` cmds/tok, **`12.20 ms` DSP (`+16.0%` decode)** |
+| **`ggml-c7x` with FA2 + `Q8_0` KV (`-fa 1 -ctk q8_0 -ctv q8_0`)** | **`Q8_0` (2× smaller)** | **`151.55 ± 0.03`** | **`49.00 ± 0.01`** | **`3.28×` / `1.71×`** | Halves KV RAM while still beating baseline F16 decode |
 
 - **Live Silicon Op Verification:** `test-backend-ops -b C7X0 -o FLASH_ATTN_EXT` **`3,648 / 3,648 PASS`**; `llama-perplexity` (`-c 128 --chunks 2`) matches `-fa 0` within `0.6%` (`76.34` vs `75.85`, chunk 1 `81.49` vs `81.51`).
 
