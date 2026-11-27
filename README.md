@@ -55,34 +55,69 @@ flowchart TB
   <img alt="Live BeagleBone AI-64 Silicon Vision and Audio ONNX Results" src="docs/assets/non-llm-bench-dark.svg">
 </picture>
 
+- **Board OS setup guide (BeagleBoard Debian 6.18 vs. Yocto Poky 6.18):** [`docs/OS_SETUP.md`](docs/OS_SETUP.md)
 - **Full hardware tables, perplexity comparisons (`W4A8` vs `GGML_C7X_W8A8=1`), and long-context (`4K`) numbers:** [`docs/RESULTS.md`](docs/RESULTS.md)
 - **Address map (7.625 MiB MSMC + 1.5 GiB high-DDR arena) & cache rules:** [`docs/MEMORY.md`](docs/MEMORY.md)
 - **Emulator-vs-silicon pitfalls & compiler quirks:** [`docs/NOTES.md`](docs/NOTES.md)
 
 ---
 
-## Step 0: Build & Flash Shared Board Setup (Required for All 3 Paths)
+## Step 0: Choose Your Board OS Setup (Debian 6.18 vs. Yocto Poky 6.18)
 
-All toolchains run inside reproducible Podman/Docker containers (`platform/containers/`) — no local TI CGT or aarch64 cross-compiler needed:
+Like the parent [`BeagleBoneAI64-linux-zephyr-pru-c7x-c66x-demo`](https://github.com/kevinacahalan/BeagleBoneAI64-linux-zephyr-pru-c7x-c66x-demo) project, there are **two ways to run Linux 6.18 on the BeagleBone AI-64**. Both deliver the **same C7x firmware, DDR arenas, and benchmark speeds** — pick the OS workflow that fits how you work:
+
+| | Option A: BeagleBoard Debian 6.18 *(Recommended)* | Option B: Yocto Poky 6.18 (`platform/yocto/`) |
+| --- | --- | --- |
+| **Kernel** | BeagleBoard.org `6.18.x-arm64-k3` (no patched modules needed) | TI `linux-ti-staging` `6.18.51-ti` + U-Boot `2026.01` |
+| **Setup flow** | Flash official Debian 13.7 IoT v6.18 → build bundle in containers (`~5–10 min`) → `install-beagle.sh` + reboot | Build self-contained `.wic.xz` via `kas-container` (`~3 h` first build, minutes with sstate cache) → flash & boot |
+| **What's installed** | `install-beagle.sh` installs all 3 paths (`c7x-ai`, `c7x-ai.elf`, DTBO, `libggml-c7x.so`, `libort-c7x-ep.so`, `test_ort_c7x_ep`, ONNX models) | Image bakes Path 1 (`c7x-ai`), `c7x-ai.elf`, DTBO + `extlinux.conf`, and Path 3 (`libc7x`, `ort-c7x-ep`, ONNX models); copy cross-compiled `llama.cpp` + `libggml-c7x.so` for Path 2 |
+| **Environment** | Full Debian (`apt`, Python, optional on-board `cmake`/`g++`); use **`sudo`** for `/dev/mem` | Minimal ~70 MiB `.wic.xz` rootfs (no `apt`/compiler); passwordless **`root`** dev login |
+
+See **[`docs/OS_SETUP.md`](docs/OS_SETUP.md)** for the full side-by-side guide, manual `dd`/`sysconf.txt` flashing, and how `c7x-ai` handles both 6.18 kernels without out-of-tree modules.
+
+### Option A: BeagleBoard Debian 6.18 (Container Build + `install-beagle.sh`)
+
+1. Flash [BeagleBone AI-64 Debian 13.7 IoT, v6.18 k3](https://www.beagleboard.org/distros/bbai64-debian-13-7-2026-10-09-iot-v6-18-x-k3) with BeagleBoard Imager (or `dd` + `sysconf.txt`) and wait for its first-boot auto-resize cycles to reach SSH.
+2. Build all host-emulation tests, aarch64 binaries, and the unified bundle on your PC (Podman or Docker; no local TI CGT or cross-compiler needed):
 
 ```bash
-# Build & run all x86_64 host-emulation tests + aarch64 board binaries + DT overlay
 ./platform/beagle-linux/scripts/build.sh all
 ./platform/beagle-linux/scripts/build.sh bundle
 
-# Deploy to the BeagleBone AI-64
+# Deploy to the BeagleBone AI-64 (enables the DDR arena overlay in extlinux.conf automatically)
 scp -r out/c7x-ai-beagle USER@BOARD:
 ssh -t USER@BOARD 'sudo ./c7x-ai-beagle/install-beagle.sh && sudo reboot'
 
 # After reboot, load the shared C7x firmware and verify silicon health
-ssh USER@BOARD 'c7x-ai load c7x-ai.elf && c7x-ai status && c7x-ai bench all'
+ssh USER@BOARD 'sudo c7x-ai load c7x-ai.elf && sudo c7x-ai status && sudo c7x-ai bench all'
 ```
 
 *(Individual build targets: `host-test`, `dsp`, `libc7x`, `ggml`, `ort`, `linux`, `overlay`, `bundle`.)*
 
+### Option B: Custom Yocto Poky 6.18 Image (`meta-ai64`)
+
+No `build.sh` or `install-beagle.sh` is needed — `kas-container` builds a flashable microSD image with `c7x-ai`, `c7x-ai.elf`, `libc7x`/`ort-c7x-ep` + ONNX models, and the enabled DDR arena overlay baked in:
+
+```bash
+wget -O kas-container https://raw.githubusercontent.com/siemens/kas/5.5/kas-container
+chmod +x kas-container
+KAS_BUILD_DIR=platform/yocto/build ./kas-container build platform/yocto/kas/ai64-poky.yml
+
+# Flash to microSD (verify /dev/sdX with lsblk first)
+xz -dc platform/yocto/build/deploy-ti/images/beaglebone-ai64/ai64-demo-image-beaglebone-ai64.rootfs.wic.xz \
+  | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+
+# Boot, SSH in as root (no password; bench use only), and run immediately
+ssh root@BOARD 'c7x-ai load c7x-ai.elf && c7x-ai bench all'
+```
+
+See [`platform/yocto/README.md`](platform/yocto/README.md) for `DL_DIR`/`SSTATE_DIR` cache sharing and kernel details.
+
 ---
 
 ## Quick Starts by Runtime Path
+
+*(Prefix **board** commands below with `sudo` on BeagleBoard Debian 6.18; run directly as `root` on the Yocto image.)*
 
 ### Path 1: Fastest Native LLM Runtime (`frontends/c7x-ai/`)
 
@@ -104,10 +139,10 @@ See [`frontends/c7x-ai/README.md`](frontends/c7x-ai/README.md) for all CLI comma
 
 ### Path 2: Unmodified `llama.cpp` Dynamic Backend (`frontends/ggml-c7x/`)
 
-`install-beagle.sh` installs `/usr/lib/c7x-ai/libggml-c7x.so` directly onto the board. Build upstream `llama.cpp` with `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON` (zero patches to `llama.cpp`) and point `GGML_BACKEND_PATH` at it:
+On Debian, `install-beagle.sh` installs `/usr/lib/c7x-ai/libggml-c7x.so` when `models/llama.cpp` was cloned before `build.sh all`. On Yocto, build `libggml-c7x.so` (`build.sh ggml`) and cross-compile `llama.cpp` on your PC and `scp` them over (exact commands in [`docs/OS_SETUP.md`](docs/OS_SETUP.md)). Build upstream `llama.cpp` with `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON` (zero patches) and point `GGML_BACKEND_PATH` at the plugin:
 
 ```bash
-# On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`):
+# On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`; add `sudo` on Debian):
 GGML_BACKEND_PATH=/usr/lib/c7x-ai/libggml-c7x.so llama-bench --list-devices
 GGML_BACKEND_PATH=/usr/lib/c7x-ai/libggml-c7x.so llama-completion -m model-Q4_0.gguf -ngl 99 -p "Hello"
 
@@ -122,10 +157,10 @@ See [`frontends/ggml-c7x/README.md`](frontends/ggml-c7x/README.md) for supported
 
 ### Path 3: ONNX Vision & Audio Execution Provider (`frontends/ort-c7x-ep/`)
 
-`install-beagle.sh` installs `/usr/lib/c7x-ai/libort-c7x-ep.so`, `/usr/lib/c7x-ai/test_ort_c7x_ep`, and all four ONNX verification models (`mobilenet_qlinear`, `audio_enc_block`, `mobilenet_e2e_hybrid`, `whisper_erf_hybrid`) into `/usr/share/c7x-ai/models/`:
+Installed at `/usr/lib/c7x-ai/{libort-c7x-ep.so,test_ort_c7x_ep}` and `/usr/share/c7x-ai/models/` (all four ONNX verification models: `mobilenet_qlinear`, `audio_enc_block`, `mobilenet_e2e_hybrid`, `whisper_erf_hybrid`) by `install-beagle.sh` on Debian and pre-baked into `ai64-demo-image` on Yocto:
 
 ```bash
-# On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`):
+# On BeagleBone AI-64 (after `c7x-ai load c7x-ai.elf`; add `sudo` on Debian):
 /usr/lib/c7x-ai/test_ort_c7x_ep /usr/share/c7x-ai/models 20
 ```
 
@@ -153,7 +188,7 @@ platform/                     Board packaging, OS images & reproducible toolchai
 └── yocto/                    Minimal Poky Linux 6.18 kas + meta-ai64 layer
 
 tools/                        HuggingFace converter (convert_hf.py), Python ref, SVG chart generator
-docs/                         MEMORY.md, NOTES.md, RESULTS.md, and docs/assets/*.svg
+docs/                         OS_SETUP.md, MEMORY.md, NOTES.md, RESULTS.md, and docs/assets/*.svg
 ```
 
 ---

@@ -8,7 +8,7 @@ CXX_HOST    ?= g++
 AR_HOST     ?= ar
 
 INC_FLAGS   := -Iinclude -Isrc -I../../runtime/libc7x/include -I../../runtime/dsp/include
-COMMON_CXX  := -O2 -fPIC -std=c++17 -Wall -Wextra $(INC_FLAGS)
+COMMON_CXX  := -O2 -fPIC -std=c++17 -Wall -Wextra $(INC_FLAGS) $(EXTRA_CXXFLAGS)
 
 BUILD_HW    := build-aarch64
 BUILD_EMU   := build-hostemu
@@ -34,10 +34,10 @@ $(BUILD_HW)/c7x_ort_ep.o: src/c7x_ort_ep.cpp src/onnx_proto.hpp include/c7x_ort_
 	$(CXX_AARCH64) $(COMMON_CXX) -c -o $@ $<
 
 $(BUILD_HW)/libort-c7x-ep.so: $(BUILD_HW)/c7x_ort_ep.o $(HW_SHIM_OBJ) ../../runtime/libc7x/build-aarch64/libc7x.a
-	$(CXX_AARCH64) $(COMMON_CXX) -shared -o $@ $(BUILD_HW)/c7x_ort_ep.o $(HW_SHIM_OBJ) ../../runtime/libc7x/build-aarch64/libc7x.a -lpthread -lm
+	$(CXX_AARCH64) $(COMMON_CXX) $(LDFLAGS) -shared -Wl,-soname,libort-c7x-ep.so -o $@ $(BUILD_HW)/c7x_ort_ep.o $(HW_SHIM_OBJ) ../../runtime/libc7x/build-aarch64/libc7x.a -lpthread -lm
 
 $(BUILD_HW)/test_ort_c7x_ep: tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a
-	$(CXX_AARCH64) $(COMMON_CXX) tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a -lpthread -lm -o $@
+	$(CXX_AARCH64) $(COMMON_CXX) $(LDFLAGS) tests/test_ort_c7x_ep.cpp $(BUILD_HW)/c7x_ort_ep.o ../../runtime/libc7x/build-aarch64/libc7x.a -lpthread -lm -o $@
 
 hostemu: $(BUILD_EMU)/libort-c7x-ep.so $(BUILD_EMU)/test_ort_c7x_ep $(BUILD_EMU)/test_ort_c_api_shim
 

@@ -1,1 +1,1 @@
-`meta-ai64` builds `c7x-ai`, the bare-metal C7x firmware (`c7x-ai.elf`), and the DDR tensor arena device-tree overlay into `ai64-demo-image`.
+`meta-ai64` builds `c7x-ai`, `c7x-ai.elf`, `libc7x` + `ort-c7x-ep` (`libort-c7x-ep.so`, `test_ort_c7x_ep`, and ONNX verification models), and the DDR tensor arena device-tree overlay into `ai64-demo-image`.

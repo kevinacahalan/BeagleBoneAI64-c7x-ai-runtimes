@@ -26,9 +26,10 @@ Zero-dependency standard `.onnx` binary protobuf loader, graph partitioner/compi
 ./platform/beagle-linux/scripts/build.sh ort
 ```
 
-On the BeagleBone AI-64 (installed by `install-beagle.sh`, after `c7x-ai load c7x-ai.elf`):
+On the BeagleBone AI-64 (installed by `install-beagle.sh` on Debian or baked into `ai64-demo-image` on Yocto, after `c7x-ai load c7x-ai.elf`):
 
 ```bash
+# Prefix with `sudo` on BeagleBoard Debian 6.18; run directly as `root` on Yocto:
 /usr/lib/c7x-ai/test_ort_c7x_ep /usr/share/c7x-ai/models 20
 ```
 

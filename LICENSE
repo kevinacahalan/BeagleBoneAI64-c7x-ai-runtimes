@@ -22,9 +22,9 @@ SOFTWARE.
 
 Exceptions. These files keep their own licenses:
 
-- yocto/layers/meta-ai64/recipes-support/bb-usb-gadgets/bb-usb-gadgets/: MIT,
+- platform/yocto/layers/meta-ai64/recipes-support/bb-usb-gadgets/bb-usb-gadgets/: MIT,
   Copyright (c) 2015 Robert Nelson; see the copyright file there.
-- yocto/layers/meta-ai64/patches/: a patch to BitBake, GPL-2.0-only like
+- platform/yocto/layers/meta-ai64/patches/: a patch to BitBake, GPL-2.0-only like
   BitBake itself.
 
 Toolchains and third-party software fetched at build time (such as the TI

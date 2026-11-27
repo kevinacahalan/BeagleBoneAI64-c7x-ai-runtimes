@@ -8,10 +8,12 @@
 #
 # TI's file is kas/poky-wrynose-config.yml, which includes two templates
 # from the same repo. kas resolves those includes inside oe-layersetup, so
-# this copy folds all three into one file instead. Each part is marked
-# below and is unchanged apart from the folding: nothing here is ours.
-# Our changes (pinned commits, paths, the bitbake patch, meta-ai64, and
-# the local.conf additions) stay in yocto/kas/ai64-poky.yml.
+# this copy folds all three into one file instead. Apart from folding and
+# changing DL_DIR / SSTATE_DIR from `=` to `?=` (kas sorts local_conf_header
+# keys alphabetically, so this block runs after ai64-poky and `?=` is needed
+# for kas-container's DL_DIR / SSTATE_DIR env overrides to take effect),
+# nothing here is ours. Our changes (pinned commits, paths, the bitbake patch,
+# meta-ai64, and local.conf additions) stay in platform/yocto/kas/ai64-poky.yml.
 #
 # To move to a newer TI release, copy the three files from the new commit
 # the same way and update the commit above.
@@ -102,7 +104,7 @@ local_conf_header:
     # wiping and rebuilding you can preserve this directory to speed up this part
     # of subsequent builds. This directory is safe to share between multiple builds
     # on the same machine too.
-    DL_DIR = "${TOPDIR}/../downloads"
+    DL_DIR ?= "${TOPDIR}/../downloads"
 
     #
     # Where to place shared-state files
@@ -115,7 +117,7 @@ local_conf_header:
     # regenerate from these files if no changes were made to the configuration.
     # If changes were made to the configuration, only shared state files where the
     # state was still valid would be used (done using checksums).
-    SSTATE_DIR = "${TOPDIR}/sstate-cache"
+    SSTATE_DIR ?= "${TOPDIR}/sstate-cache"
 
     #
     # Shared-state files from other locations
