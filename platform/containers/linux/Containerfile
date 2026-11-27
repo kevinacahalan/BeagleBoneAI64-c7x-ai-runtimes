@@ -1,4 +1,4 @@
-# Linux aarch64 cross-compile image for linux-app/ and the device-tree overlay.
+# Linux aarch64 cross-compile image for frontends/, runtime/libc7x/, and the device-tree overlay.
 FROM docker.io/library/debian:13
 
 ENV DEBIAN_FRONTEND=noninteractive

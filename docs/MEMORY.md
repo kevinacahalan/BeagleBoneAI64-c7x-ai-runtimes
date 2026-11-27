@@ -1,6 +1,6 @@
 # Memory Map
 
-All memory regions shared between Linux (2× Cortex-A72) and the bare-metal C7x DSP + MMA on the BeagleBone AI-64 (TI TDA4VM / J721E). The header [`dsp/include/c7x_ai_proto.h`](dsp/include/c7x_ai_proto.h) and MMU setup [`dsp/c7x/mmu.c`](dsp/c7x/mmu.c) are the source of truth.
+All memory regions shared between Linux (2× Cortex-A72) and the bare-metal C7x DSP + MMA on the BeagleBone AI-64 (TI TDA4VM / J721E). The header [`runtime/dsp/include/c7x_ai_proto.h`](../runtime/dsp/include/c7x_ai_proto.h) and MMU setup [`runtime/dsp/c7x/mmu.c`](../runtime/dsp/c7x/mmu.c) are the source of truth.
 
 ## On-Chip Memory
 

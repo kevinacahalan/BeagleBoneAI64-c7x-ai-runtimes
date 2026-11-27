@@ -4,9 +4,9 @@
  *
  * Used by:
  *   - tools/llama_ref.py & tools/convert_hf.py (packers & Python reference)
- *   - dsp/c7x/transformer.c (C7x DSP + MMA runtime)
- *   - dsp/host_test/test_llama.cpp (x86_64 host emulation verifier)
- *   - linux-app/llama.c (A72 Linux host loader, tokenizer & sampler)
+ *   - runtime/dsp/c7x/transformer.c (C7x DSP + MMA runtime)
+ *   - runtime/dsp/host_test/test_llama.cpp (x86_64 host emulation verifier)
+ *   - frontends/c7x-ai/llama.c (A72 Linux host loader, tokenizer & sampler)
  */
 #ifndef C7X_LLAMA_FMT_H_
 #define C7X_LLAMA_FMT_H_
